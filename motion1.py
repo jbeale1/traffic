@@ -1,9 +1,11 @@
-#!/home/pi/pieeg-env/bin/python
+#!/home/pi/my-env/bin/python
 
-# capture motion-triggered frames with Raspberry Pi HQ camera and PiCamera2
+# capture motion-triggered frames with PiCamera2
 # using a low-res stream for motion detection
 # sampled ~10 fps, saved ~3 fps using 2nd thread for JPEG encoding and disk I/O
-# J.Beale 2026-03-30
+# writes log entries for each motion event with timestamps, brightness, motion size, etc.
+# pushes saved JPEGs to remote host via rsync as soon as they are written
+# J.Beale 2026-03-31
 
 import piexif
 from PIL import Image
@@ -15,8 +17,20 @@ import time
 from datetime import datetime
 import threading
 from collections import deque
+import os
+import csv
+import subprocess
 
-# ROI in main (full-res) coordinates
+LOG_DIR = "/home/pi/CAM9"  # save motion log here
+
+# Remote destination for storing JPEGs
+REMOTE_HOST = "user@host.local"  # update to actual remote host
+REMOTE_DIR  = "/mnt/data/CAM9/"  # update to actual directory on the remote host for images
+
+TRANSFER_BUFFER_SIZE = 64   # max queued filenames (each ~1.3 MB in /dev/shm)
+TRANSFER_MAX_RETRIES = 3    # give up after this many consecutive rsync failures
+
+# ROI in main (full-res) coordinates : useful portion of frame
 ROI_X1, ROI_Y1 = 720, 0
 ROI_X2, ROI_Y2 = 4055, 2252
 
@@ -26,26 +40,74 @@ LORES_Y1 = round(ROI_Y1 * 480 / 3040)  # 0
 LORES_X2 = round(ROI_X2 * 640 / 4056)  # 638
 LORES_Y2 = round(ROI_Y2 * 480 / 3040)  # 355
 
+# Day/night switching thresholds and parameters
 MAX_SHUTTER_US     = 2000   # night mode fixed shutter (usec)
 THRESHOLD_NIGHT    = 40     # changed pixels to trigger at night (small lights)
 THRESHOLD_DAY      = 5000   # changed pixels to trigger in daytime
 DAY_THRESHOLD      = 25     # bg brightness above this -> day candidate
 NIGHT_THRESHOLD    = 20     # bg brightness below this -> night candidate
 SWITCH_INTERVALS   = 3      # consecutive summary intervals to confirm mode switch
-SUMMARY_INTERVAL   = 200    # frames per summary (600 = 1 min at 10 fps)
+SUMMARY_INTERVAL   = 200    # frames per summary (~1 min at 10 fps)
 SAVE_BUFFER_SIZE   = 12
 
+# Global state variables
 verbose       = False
 is_night_mode = False  # start in day mode
 threshold     = THRESHOLD_DAY
 prev_gray     = None
-last_timestamp       = ""
-frame_in_second      = 0
-bg_accum             = 0.0
-bg_count             = 0
-summary_frame        = 0
-day_candidate_count  = 0
+last_timestamp        = ""
+frame_in_second       = 0
+bg_accum              = 0.0
+bg_count              = 0
+summary_frame         = 0
+day_candidate_count   = 0
 night_candidate_count = 0
+
+# Event logging variables
+in_motion_event   = False
+event_t_start     = 0.0
+event_frame_count = 0
+event_max_px      = 0
+event_peak_fname  = ""
+event_pre_px      = 0
+event_last_px     = 0
+event_shutter_sum = 0.0
+event_gain_sum    = 0.0
+event_bg_brightness = 0.0
+event_com_x_list  = []   # lores-space x CoM per motion frame
+
+def write_event_log(evt):
+    log_path = os.path.join(LOG_DIR, f"log_motion_{datetime.fromtimestamp(evt['t_start']).strftime('%Y%m%d')}.csv")
+    is_new = not os.path.exists(log_path)
+
+    com_list = evt['com_x_list']
+    if len(com_list) >= 2:
+        velocity = np.polyfit(range(len(com_list)), com_list, 1)[0]
+    elif len(com_list) == 1:
+        velocity = 0.0
+    else:
+        velocity = float('nan')
+
+    with open(log_path, "a", newline="") as f:
+        w = csv.writer(f)
+        if is_new:
+            w.writerow(["epoch_start", "time_hms", "peak_fname", "duration_s", "frame_count",
+                        "bg_brightness", "max_motion_px", "pre_event_px", "post_event_px",
+                        "mean_shutter_us", "mean_gain", "velocity_px_per_frame"])
+        w.writerow([
+            f"{evt['t_start']:.1f}",
+            datetime.fromtimestamp(evt['t_start']).strftime('%H:%M:%S'),
+            evt['peak_fname'],
+            f"{evt['duration']:.1f}",
+            evt['frame_count'],
+            f"{evt['bg_brightness']:.1f}",
+            evt['max_motion_px'],
+            evt['pre_event_px'],
+            evt['post_event_px'],
+            f"{evt['mean_shutter']:.0f}",
+            f"{evt['mean_gain']:.2f}",
+            f"{velocity:.1f}",
+        ])
 
 def apply_night_mode(cam):
     global threshold, is_night_mode
@@ -86,8 +148,57 @@ def saver_thread():
                 frame, fname, exif_bytes = save_queue.popleft()
             img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             img.save(fname, "JPEG", quality=85, exif=exif_bytes)
+            # Enqueue for transfer only after the file is fully written
+            with transfer_lock:
+                transfer_queue.append(fname)
+            transfer_event.set()
 
 threading.Thread(target=saver_thread, daemon=True).start()
+
+# --- Transfer thread ---
+transfer_queue = deque(maxlen=TRANSFER_BUFFER_SIZE)
+transfer_event = threading.Event()
+transfer_lock  = threading.Lock()
+
+def transfer_thread():
+    consecutive_failures = 0
+    while True:
+        transfer_event.wait()
+        transfer_event.clear()
+        while True:
+            with transfer_lock:
+                if not transfer_queue:
+                    break
+                fpath = transfer_queue.popleft()
+
+            if not os.path.exists(fpath):
+                # Already gone (shouldn't happen, but be safe)
+                continue
+
+            result = subprocess.run(
+                ["rsync", "--remove-source-files", "-q",
+                 fpath, f"{REMOTE_HOST}:{REMOTE_DIR}"],
+                capture_output=True
+            )
+
+            if result.returncode == 0:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                err = result.stderr.decode().strip()
+                print(f"[transfer] rsync failed ({consecutive_failures}/{TRANSFER_MAX_RETRIES}): {err}")
+                if consecutive_failures < TRANSFER_MAX_RETRIES:
+                    # Put it back at the front and pause before retrying
+                    with transfer_lock:
+                        transfer_queue.appendleft(fpath)
+                    time.sleep(5)
+                    transfer_event.set()
+                else:
+                    print(f"[transfer] giving up on {fpath} after {TRANSFER_MAX_RETRIES} failures")
+                    consecutive_failures = 0
+                break  # re-enter wait loop; event will be set again if queue non-empty
+
+threading.Thread(target=transfer_thread, daemon=True).start()
 
 # --- Camera setup ---
 picam2 = Picamera2()
@@ -114,7 +225,8 @@ while True:
     gray_roi = lores[:480, :640][LORES_Y1:LORES_Y2, LORES_X1:LORES_X2]
 
     if prev_gray is not None:
-        changed = np.sum(cv2.absdiff(gray_roi, prev_gray) > 25)
+        diff_mask = cv2.absdiff(gray_roi, prev_gray) > 25
+        changed   = np.sum(diff_mask)
         if verbose and changed > 5:
             print(changed)
 
@@ -144,9 +256,53 @@ while True:
                 if dropped:
                     print("WARNING: save buffer full, oldest frame dropped")
                 print(fname)
+
+            # X center of mass of changed pixels in lores ROI
+            col_sums = diff_mask.sum(axis=0).astype(float)
+            if col_sums.sum() > 0:
+                com_x = np.average(np.arange(diff_mask.shape[1]), weights=col_sums)
+                event_com_x_list.append(LORES_X1 + com_x)  # absolute lores x
+
+            # Event tracking
+            if not in_motion_event:
+                in_motion_event     = True
+                event_t_start       = time.time()
+                event_frame_count   = 0
+                event_max_px        = 0
+                event_peak_fname    = os.path.basename(fname)
+                event_pre_px        = event_last_px
+                event_shutter_sum   = 0.0
+                event_gain_sum      = 0.0
+                event_bg_brightness = bg_accum / bg_count if bg_count > 0 else 0.0
+                event_com_x_list.clear()
+            event_frame_count += 1
+            event_shutter_sum += shutter_us
+            event_gain_sum    += gain
+            if changed > event_max_px:
+                event_max_px     = changed
+                event_peak_fname = os.path.basename(fname)
+            event_last_px = changed
+
         else:
+            # Non-motion frame
+            if in_motion_event:
+                in_motion_event = False
+                write_event_log({
+                    "t_start":       event_t_start,
+                    "duration":      time.time() - event_t_start,
+                    "peak_fname":    event_peak_fname,
+                    "frame_count":   event_frame_count,
+                    "bg_brightness": event_bg_brightness,
+                    "max_motion_px": event_max_px,
+                    "pre_event_px":  event_pre_px,
+                    "post_event_px": changed,
+                    "mean_shutter":  event_shutter_sum / event_frame_count,
+                    "mean_gain":     event_gain_sum    / event_frame_count,
+                    "com_x_list":    list(event_com_x_list),
+                })
             bg_accum += float(np.mean(gray_roi))
             bg_count += 1
+            event_last_px = changed
 
         summary_frame += 1
         if summary_frame >= SUMMARY_INTERVAL:
@@ -158,7 +314,7 @@ while True:
                           f"  ({bg_count}/{SUMMARY_INTERVAL} non-motion frames)  thr={threshold}")
 
                 # Unified day/night switching logic
-                going_day   = is_night_mode  and bg_avg >= DAY_THRESHOLD
+                going_day   = is_night_mode     and bg_avg >= DAY_THRESHOLD
                 going_night = not is_night_mode and bg_avg <= NIGHT_THRESHOLD
 
                 if going_day:
@@ -191,4 +347,3 @@ while True:
 
     prev_gray = gray_roi
     time.sleep(0.05)
-
