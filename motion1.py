@@ -1,14 +1,13 @@
 #!/home/pi/my-env/bin/python
 
 # capture motion-triggered frames with PiCamera2
-# using a low-res stream for motion detection
+# uses a low-res stream for motion detection
 # sampled ~10 fps, saved ~3 fps using 2nd thread for JPEG encoding and disk I/O
 # writes log entries for each motion event with timestamps, brightness, motion size, etc.
 # pushes saved JPEGs to remote host via rsync as soon as they are written
 # serves a decimated MJPEG stream on port 8080 for live preview in a browser
+# J.Beale 2026-04-10
 # custom AeExposureMode limits longest shutter speed to 2 msec
-
-# J.Beale 2026-04-09
 
 import os
 import piexif
@@ -26,13 +25,13 @@ import subprocess
 
 import io       # for mjpeg server
 import socket
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG_DIR = "/home/pi/CAM9"  # save motion log here
 
 # Remote destination for pushed JPEGs
-REMOTE_HOST = "me@myhost.local"
-REMOTE_DIR  = "/mnt/drive/CAM9/"
+REMOTE_HOST = "me@myserver.local"
+REMOTE_DIR  = "/mnt/data/CAM9/"
 TRANSFER_BUFFER_SIZE = 64   # max queued filenames (each ~1.3 MB in /dev/shm)
 TRANSFER_MAX_RETRIES = 3    # give up after this many consecutive rsync failures
 
@@ -87,6 +86,9 @@ event_shutter_sum = 0.0
 event_gain_sum    = 0.0
 event_bg_brightness = 0.0
 event_com_x_list  = []   # lores-space x CoM per motion frame
+
+_preview_last_fname = ""   # last motion-triggered filename
+_preview_timestamp  = ""   # timestamp of last preview frame
 
 def write_event_log(evt):
     log_path = os.path.join(LOG_DIR, f"log_motion_{datetime.fromtimestamp(evt['t_start']).strftime('%Y%m%d')}.csv")
@@ -216,10 +218,11 @@ _preview_frame_count = 0   # counts lores frames for decimation
 
 class _PreviewHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
-        pass  # suppress access log noise
+        pass
 
     def do_GET(self):
-        if self.path in ("/", "/snapshot"):
+        path = self.path.split("?")[0]  # strip query string
+        if path == "/snapshot":
             with _preview_lock:
                 data = _preview_jpeg
             if not data:
@@ -228,11 +231,23 @@ class _PreviewHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "image/jpeg")
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
             self.end_headers()
             self.wfile.write(data)
 
-        elif self.path == "/stream":
+        elif path == "/status":
+            with _preview_lock:
+                ts    = _preview_timestamp
+                fname = _preview_last_fname
+            body = f"{ts}  |  last saved: {fname or '(none yet)'}".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif path == "/mjpeg":
             self.send_response(200)
             self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
             self.send_header("Cache-Control", "no-cache")
@@ -247,14 +262,56 @@ class _PreviewHandler(BaseHTTPRequestHandler):
                             + f"Content-Length: {len(data)}\r\n\r\n".encode()
                             + data + b"\r\n"
                         )
-                    time.sleep(1.0)   # ~1 fps to the browser
+                        self.wfile.flush()
+                    time.sleep(1.0)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+
+        elif path in ("/", "/stream"):
+            html = b"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>CAM9 Preview</title>
+<style>
+  body { background:#111; color:#ccc; font-family:monospace;
+         display:flex; flex-direction:column; align-items:center;
+         margin:0; padding:8px; }
+  img  { max-width:100%; border:1px solid #444; }
+  #status { margin-top:6px; font-size:14px; letter-spacing:0.03em; }
+</style>
+</head><body>
+<img src="/snapshot" id="feed">
+<div id="status">connecting...</div>
+<script>
+  setInterval(function(){
+    var ts = Date.now();
+    document.getElementById("feed").src = "/snapshot?_=" + ts;
+    fetch("/status?_=" + ts)
+      .then(r => r.text())
+      .then(t => { document.getElementById("status").textContent = t; })
+      .catch(() => {});
+  }, 1000);
+
+  document.addEventListener("visibilitychange", function() {
+    if (!document.hidden) {
+      window.location.reload();
+    }
+  });
+
+</script>
+</body></html>"""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+
         else:
             self.send_error(404)
 
+
 def _preview_server_thread():
-    srv = HTTPServer(("", PREVIEW_PORT), _PreviewHandler)
+    srv = ThreadingHTTPServer(("", PREVIEW_PORT), _PreviewHandler)
     srv.serve_forever()
 
 threading.Thread(target=_preview_server_thread, daemon=True).start()
@@ -349,14 +406,15 @@ while True:
         _preview_frame_count = 0
 
         # Shape (720, 640) is packed planar YUV420 (I420): 480 Y rows + 240 chroma rows, 1 channel
+
+
         bgr_full = cv2.cvtColor(lores, cv2.COLOR_YUV2BGR_I420)
         bgr_preview = bgr_full[:480, :640]
         ok, jpg_buf = cv2.imencode(".jpg", bgr_preview, [cv2.IMWRITE_JPEG_QUALITY, 70])
-
         if ok:
             with _preview_lock:
-                _preview_jpeg = jpg_buf.tobytes()
-
+                _preview_jpeg     = jpg_buf.tobytes()
+                _preview_timestamp = datetime.now().strftime("%H:%M:%S")
 
     gray_roi = lores[:480, :640][LORES_Y1:LORES_Y2, LORES_X1:LORES_X2]
 
@@ -384,6 +442,8 @@ while True:
                            if sensor_ts_ns is not None and _sensor_anchor_ns is not None else None)
             exposure_dt = sensor_to_exposure_start(sensor_ts_ns, is_first)
             fname       = make_fname(exposure_dt, now)
+            with _preview_lock:
+                _preview_last_fname = os.path.basename(fname)
 
             write_timing_log(fname, now, sensor_dt, exposure_dt)
 
