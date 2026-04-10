@@ -5,8 +5,12 @@
 # sampled ~10 fps, saved ~3 fps using 2nd thread for JPEG encoding and disk I/O
 # writes log entries for each motion event with timestamps, brightness, motion size, etc.
 # pushes saved JPEGs to remote host via rsync as soon as they are written
-# J.Beale 2026-03-31
+# serves a decimated MJPEG stream on port 8080 for live preview in a browser
+# custom AeExposureMode limits longest shutter speed to 2 msec
 
+# J.Beale 2026-04-09
+
+import os
 import piexif
 from PIL import Image
 import cv2
@@ -14,23 +18,25 @@ import numpy as np
 from picamera2 import Picamera2
 from libcamera import ColorSpace, controls
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import threading
 from collections import deque
-import os
 import csv
 import subprocess
 
+import io       # for mjpeg server
+import socket
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 LOG_DIR = "/home/pi/CAM9"  # save motion log here
 
-# Remote destination for storing JPEGs
-REMOTE_HOST = "user@host.local"  # update to actual remote host
-REMOTE_DIR  = "/mnt/data/CAM9/"  # update to actual directory on the remote host for images
-
+# Remote destination for pushed JPEGs
+REMOTE_HOST = "me@myhost.local"
+REMOTE_DIR  = "/mnt/drive/CAM9/"
 TRANSFER_BUFFER_SIZE = 64   # max queued filenames (each ~1.3 MB in /dev/shm)
 TRANSFER_MAX_RETRIES = 3    # give up after this many consecutive rsync failures
 
-# ROI in main (full-res) coordinates : useful portion of frame
+# ROI in main (full-res) coordinates
 ROI_X1, ROI_Y1 = 720, 0
 ROI_X2, ROI_Y2 = 4055, 2252
 
@@ -43,20 +49,26 @@ LORES_Y2 = round(ROI_Y2 * 480 / 3040)  # 355
 # Day/night switching thresholds and parameters
 MAX_SHUTTER_US     = 2000   # night mode fixed shutter (usec)
 THRESHOLD_NIGHT    = 40     # changed pixels to trigger at night (small lights)
-THRESHOLD_DAY      = 5000   # changed pixels to trigger in daytime
+THRESHOLD_DAY      = 4000   # changed pixels to trigger in daytime
 DAY_THRESHOLD      = 25     # bg brightness above this -> day candidate
 NIGHT_THRESHOLD    = 20     # bg brightness below this -> night candidate
 SWITCH_INTERVALS   = 3      # consecutive summary intervals to confirm mode switch
 SUMMARY_INTERVAL   = 200    # frames per summary (~1 min at 10 fps)
 SAVE_BUFFER_SIZE   = 12
 
+# Pipeline latency corrections (sensor timestamp -> actual exposure start).
+# The sensor timestamp marks end-of-pipeline delivery, not exposure start.
+# First frame of each event uses a smaller correction (~40 ms less) due to
+# pipeline buffering behaviour observed empirically.
+LATENCY_FIRST_MS  = 405    # ms to subtract for first frame of a motion event
+LATENCY_STEADY_MS = 441    # ms to subtract for subsequent frames (cal ref: GPS UTC pps)
+
 # Global state variables
 verbose       = False
 is_night_mode = False  # start in day mode
 threshold     = THRESHOLD_DAY
 prev_gray     = None
-last_timestamp        = ""
-frame_in_second       = 0
+
 bg_accum              = 0.0
 bg_count              = 0
 summary_frame         = 0
@@ -115,8 +127,7 @@ def apply_night_mode(cam):
     is_night_mode = True
     cam.set_controls({
         "ExposureValue":    -2.0,
-        "ExposureTimeMode": 1,
-        "ExposureTime":     MAX_SHUTTER_US,
+        "AeExposureMode":   controls.AeExposureModeEnum.Custom,
         "AnalogueGainMode": 0,
         "AwbMode":          controls.AwbModeEnum.Daylight,
     })
@@ -127,7 +138,7 @@ def apply_day_mode(cam):
     is_night_mode = False
     cam.set_controls({
         "ExposureValue":    -2.0,
-        "ExposureTimeMode": 0,
+        "AeExposureMode":   controls.AeExposureModeEnum.Custom,
         "AnalogueGainMode": 0,
         "AwbMode":          controls.AwbModeEnum.Daylight,
     })
@@ -161,7 +172,7 @@ transfer_event = threading.Event()
 transfer_lock  = threading.Lock()
 
 def transfer_thread():
-    consecutive_failures = 0
+    retry_delay = 5   # seconds; doubles on each failure, caps at 60
     while True:
         transfer_event.wait()
         transfer_event.clear()
@@ -172,7 +183,7 @@ def transfer_thread():
                 fpath = transfer_queue.popleft()
 
             if not os.path.exists(fpath):
-                # Already gone (shouldn't happen, but be safe)
+                retry_delay = 5
                 continue
 
             result = subprocess.run(
@@ -182,26 +193,77 @@ def transfer_thread():
             )
 
             if result.returncode == 0:
-                consecutive_failures = 0
+                retry_delay = 5  # reset backoff on success
             else:
-                consecutive_failures += 1
                 err = result.stderr.decode().strip()
-                print(f"[transfer] rsync failed ({consecutive_failures}/{TRANSFER_MAX_RETRIES}): {err}")
-                if consecutive_failures < TRANSFER_MAX_RETRIES:
-                    # Put it back at the front and pause before retrying
-                    with transfer_lock:
-                        transfer_queue.appendleft(fpath)
-                    time.sleep(5)
-                    transfer_event.set()
-                else:
-                    print(f"[transfer] giving up on {fpath} after {TRANSFER_MAX_RETRIES} failures")
-                    consecutive_failures = 0
-                break  # re-enter wait loop; event will be set again if queue non-empty
+                print(f"[transfer] rsync failed, retrying in {retry_delay}s: {err}")
+                with transfer_lock:
+                    transfer_queue.appendleft(fpath)
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 60)
+                transfer_event.set()
+                break  # re-enter wait loop
 
 threading.Thread(target=transfer_thread, daemon=True).start()
 
+# --- MJPEG preview server ---
+
+PREVIEW_PORT   = 8080
+PREVIEW_EVERY  = 10        # serve every Nth lores frame
+_preview_lock  = threading.Lock()
+_preview_jpeg  = b""       # latest encoded JPEG bytes
+_preview_frame_count = 0   # counts lores frames for decimation
+
+class _PreviewHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass  # suppress access log noise
+
+    def do_GET(self):
+        if self.path in ("/", "/snapshot"):
+            with _preview_lock:
+                data = _preview_jpeg
+            if not data:
+                self.send_error(503, "No frame yet")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(data)
+
+        elif self.path == "/stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            try:
+                while True:
+                    with _preview_lock:
+                        data = _preview_jpeg
+                    if data:
+                        self.wfile.write(
+                            b"--frame\r\nContent-Type: image/jpeg\r\n"
+                            + f"Content-Length: {len(data)}\r\n\r\n".encode()
+                            + data + b"\r\n"
+                        )
+                    time.sleep(1.0)   # ~1 fps to the browser
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        else:
+            self.send_error(404)
+
+def _preview_server_thread():
+    srv = HTTPServer(("", PREVIEW_PORT), _PreviewHandler)
+    srv.serve_forever()
+
+threading.Thread(target=_preview_server_thread, daemon=True).start()
+print(f"Preview server on port {PREVIEW_PORT}  /snapshot or /stream")
+
+
 # --- Camera setup ---
-picam2 = Picamera2()
+picam2 = Picamera2(tuning=Picamera2.load_tuning_file("/home/pi/CAM9/imx477_custom.json"))
+
 # Note: picam2 misleadingly names RGB888 as BGR888 and vice-versa
 config = picam2.create_still_configuration(
     main={"size": (4056, 3040), "format": "RGB888"},
@@ -219,9 +281,83 @@ print(f"AWB gains: {metadata.get('ColourGains')}")
 print(f"Shutter: {metadata.get('ExposureTime')}us  Gain: {metadata.get('AnalogueGain'):.2f}")
 print(f"Starting in {'NIGHT' if is_night_mode else 'DAY'} mode")
 
+# --- Timing anchor: correlate sensor monotonic clock to wall clock ---
+_wall_anchor      = datetime.now()
+_sensor_anchor_ns = metadata.get("SensorTimestamp", None)
+
+timing_log_lock = threading.Lock()
+
+def sensor_to_exposure_start(sensor_ts_ns, is_first_frame):
+    """Convert a raw SensorTimestamp (ns) to an estimated exposure-start datetime.
+
+    The sensor timestamp marks end-of-pipeline delivery, not exposure start.
+    We subtract the empirically measured pipeline latency:
+      - LATENCY_FIRST_MS  for the first frame of a motion event
+      - LATENCY_STEADY_MS for all subsequent frames
+    Returns None if the anchor or timestamp is unavailable.
+    """
+    if sensor_ts_ns is None or _sensor_anchor_ns is None:
+        return None
+    latency_ms = LATENCY_FIRST_MS if is_first_frame else LATENCY_STEADY_MS
+    sensor_dt  = _wall_anchor + timedelta(seconds=(sensor_ts_ns - _sensor_anchor_ns) / 1e9)
+    return sensor_dt - timedelta(milliseconds=latency_ms)
+
+def make_fname(exposure_dt, wall_dt):
+    """Return /dev/shm filename based on corrected exposure-start time,
+    falling back to wall-clock time if sensor data is unavailable."""
+    dt = exposure_dt if exposure_dt is not None else wall_dt
+    ms = dt.microsecond // 1000
+    return f"/dev/shm/{dt.strftime('%Y%m%d_%H%M%S')}_{ms:03d}.jpg"
+
+def write_timing_log(fname, wall_dt, sensor_dt, exposure_dt):
+    """Append one row per saved frame with wall, raw-sensor, and corrected exposure times."""
+    log_path = os.path.join(LOG_DIR, f"log_timing_{wall_dt.strftime('%Y%m%d')}.csv")
+    is_new   = not os.path.exists(log_path)
+
+    def fmt(dt):
+        if dt is None:
+            return "", ""
+        return (f"{dt.timestamp():.4f}",
+                dt.strftime('%H:%M:%S.') + f"{dt.microsecond // 1000:03d}")
+
+    wall_s,     wall_hms     = fmt(wall_dt)
+    sensor_s,   sensor_hms   = fmt(sensor_dt)
+    exposure_s, exposure_hms = fmt(exposure_dt)
+    diff_ms = (f"{(float(wall_s) - float(sensor_s)) * 1000:.1f}"
+               if wall_s and sensor_s else "")
+
+    with timing_log_lock:
+        with open(log_path, "a", newline="") as f:
+            w = csv.writer(f)
+            if is_new:
+                w.writerow(["filename", "wall_epoch_s", "wall_hms_ms",
+                            "sensor_epoch_s", "sensor_hms_ms",
+                            "exposure_epoch_s", "exposure_hms_ms",
+                            "wall_minus_sensor_ms"])
+            w.writerow([os.path.basename(fname),
+                        wall_s, wall_hms,
+                        sensor_s, sensor_hms,
+                        exposure_s, exposure_hms,
+                        diff_ms])
+
 # --- Main loop ---
 while True:
     lores    = picam2.capture_array("lores")
+
+    _preview_frame_count += 1
+    if _preview_frame_count >= PREVIEW_EVERY:
+        _preview_frame_count = 0
+
+        # Shape (720, 640) is packed planar YUV420 (I420): 480 Y rows + 240 chroma rows, 1 channel
+        bgr_full = cv2.cvtColor(lores, cv2.COLOR_YUV2BGR_I420)
+        bgr_preview = bgr_full[:480, :640]
+        ok, jpg_buf = cv2.imencode(".jpg", bgr_preview, [cv2.IMWRITE_JPEG_QUALITY, 70])
+
+        if ok:
+            with _preview_lock:
+                _preview_jpeg = jpg_buf.tobytes()
+
+
     gray_roi = lores[:480, :640][LORES_Y1:LORES_Y2, LORES_X1:LORES_X2]
 
     if prev_gray is not None:
@@ -234,15 +370,23 @@ while True:
             frame     = picam2.capture_array("main")
             meta      = picam2.capture_metadata()
             roi_frame = frame[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2].copy()
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            if timestamp != last_timestamp:
-                frame_in_second = 0
-                last_timestamp  = timestamp
-            fname           = f"/dev/shm/{timestamp}_{frame_in_second:02d}.jpg"
-            frame_in_second += 1
+            now       = datetime.now()
 
-            shutter_us = meta.get("ExposureTime", 0)
-            gain       = meta.get("AnalogueGain", 1.0)
+            shutter_us   = meta.get("ExposureTime", 0)
+            gain         = meta.get("AnalogueGain", 1.0)
+            sensor_ts_ns = meta.get("SensorTimestamp")
+
+            # Determine whether this is the first frame of a new motion event
+            # before updating in_motion_event, so the flag is correct for
+            # both the latency correction and the event tracking block below.
+            is_first    = not in_motion_event
+            sensor_dt   = (_wall_anchor + timedelta(seconds=(sensor_ts_ns - _sensor_anchor_ns) / 1e9)
+                           if sensor_ts_ns is not None and _sensor_anchor_ns is not None else None)
+            exposure_dt = sensor_to_exposure_start(sensor_ts_ns, is_first)
+            fname       = make_fname(exposure_dt, now)
+
+            write_timing_log(fname, now, sensor_dt, exposure_dt)
+
             exif_bytes = piexif.dump({"Exif": {
                 piexif.ExifIFD.ExposureTime:    (shutter_us, 1_000_000),
                 piexif.ExifIFD.ISOSpeedRatings: round(gain * 100),
