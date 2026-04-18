@@ -9,7 +9,7 @@
 # filters out noise/tree events by requiring minimum CoM displacement or velocity
 # custom AeExposureMode limits longest shutter speed to 2 msec
 
-# J.Beale 2026-04-12
+# J.Beale 2026-04-18
 
 import os
 import glob
@@ -361,8 +361,8 @@ def _build_timeline():
     # Blue lines; brighter for more hits in same column (base 120, +40 per extra, cap 255)
     for col, count in enumerate(hits):
         if count > 0:
-            blue = min(255, 120 + (count - 1) * 40)
-            img[:, col] = (blue, 0, 0)  # BGR
+            green = min(255, 120 + (count - 1) * 40)
+            img[:, col] = (0, green, 0)  # BGR
 
     ok, png_buf = cv2.imencode(".png", img)
     if ok:
@@ -500,6 +500,28 @@ print(f"AWB gains: {metadata.get('ColourGains')}")
 print(f"Shutter: {metadata.get('ExposureTime')}us  Gain: {metadata.get('AnalogueGain'):.2f}")
 print(f"Starting in {'NIGHT' if is_night_mode else 'DAY'} mode")
 
+# --- Wait for NTP time sync before anchoring ---
+def _wait_for_time_sync(timeout_s=120, poll_interval_s=5):
+    """Block until systemd reports the clock is NTP-synchronized, or timeout."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                ["timedatectl", "show", "--property=NTPSynchronized", "--value"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.stdout.strip() == "yes":
+                print(f"[timing] NTP synchronized, anchoring wall clock")
+                return True
+        except Exception:
+            pass
+        print(f"[timing] Waiting for NTP sync...")
+        time.sleep(poll_interval_s)
+    print(f"[timing] WARNING: NTP sync timeout after {timeout_s}s, anchoring with unsynchronized clock")
+    return False
+
+_wait_for_time_sync()
+
 # --- Timing anchor: correlate sensor monotonic clock to wall clock ---
 _wall_anchor      = datetime.now()
 _sensor_anchor_ns = metadata.get("SensorTimestamp", None)
@@ -559,30 +581,160 @@ def write_timing_log(fname, wall_dt, sensor_dt, exposure_dt):
                         exposure_s, exposure_hms,
                         diff_ms])
 
-# --- Main loop ---
-changed = 0  # initialise so /status handler never references undefined name
+def _update_preview(lores):
+    """Update the snapshot JPEG and timeline PNG at their respective rates."""
+    global _preview_frame_count, _preview_timeline_counter
+    global _preview_jpeg, _preview_timestamp
 
-while True:
-    lores = picam2.capture_array("lores")
-
-    # Snapshot preview (every PREVIEW_EVERY frames)
     _preview_frame_count += 1
     if _preview_frame_count >= PREVIEW_EVERY:
         _preview_frame_count = 0
-        # Shape (720, 640) is packed planar YUV420 (I420): 480 Y rows + 240 chroma rows
         bgr_full    = cv2.cvtColor(lores, cv2.COLOR_YUV2BGR_I420)
-        bgr_preview = bgr_full[:480, :640]
+        # bgr_preview = bgr_full[:480, :640] # full sensor frame area in lores
+        bgr_preview = bgr_full[:480, :640][LORES_Y1:LORES_Y2, LORES_X1:LORES_X2] # cropped (ROI) in lores
+
         ok, jpg_buf = cv2.imencode(".jpg", bgr_preview, [cv2.IMWRITE_JPEG_QUALITY, 70])
         if ok:
             with _preview_lock:
                 _preview_jpeg      = jpg_buf.tobytes()
                 _preview_timestamp = datetime.now().strftime("%H:%M:%S")
 
-    # Timeline bar (every TIMELINE_REGEN_FRAMES frames)
     _preview_timeline_counter += 1
     if _preview_timeline_counter >= TIMELINE_REGEN_FRAMES:
         _preview_timeline_counter = 0
         _build_timeline()
+
+def _handle_motion_frame(changed, gray_roi, diff_mask):
+    """Process one lores frame that exceeded the motion threshold."""
+    global event_max_px, event_frame_count, event_shutter_sum
+    global event_gain_sum, event_last_px, event_peak_fname
+    global _preview_last_fname
+
+    # Force-close event if it has exceeded the duration cap
+    if in_motion_event and (time.time() - event_t_start) > EVENT_MAX_DURATION_S:
+        _close_event(changed, is_cap=True)
+
+    # Start new event if needed (must come before event_fnames.append)
+    if not in_motion_event:
+        _start_event()
+
+    # Check transfer backlog before attempting full-res capture
+    with transfer_lock:
+        backlog = len(transfer_queue)
+    backlog_blocked = backlog >= MAX_SHM_BACKLOG
+
+    if not backlog_blocked:
+        frame     = picam2.capture_array("main")
+        roi_frame = frame[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2].copy()
+    else:
+        roi_frame = None
+
+    # Always capture metadata (no /dev/shm allocation)
+    meta         = picam2.capture_metadata()
+    now          = datetime.now()
+    shutter_us   = meta.get("ExposureTime", 0)
+    gain         = meta.get("AnalogueGain", 1.0)
+    sensor_ts_ns = meta.get("SensorTimestamp")
+
+    is_first    = not in_motion_event
+    sensor_dt   = (_wall_anchor + timedelta(seconds=(sensor_ts_ns - _sensor_anchor_ns) / 1e9)
+                   if sensor_ts_ns is not None and _sensor_anchor_ns is not None else None)
+    exposure_dt = sensor_to_exposure_start(sensor_ts_ns, is_first)
+    fname       = make_fname(exposure_dt, now)
+
+    if roi_frame is not None:
+        with _preview_lock:
+            _preview_last_fname = os.path.basename(fname)
+        if SAVE_TIMING_LOG:
+            write_timing_log(fname, now, sensor_dt, exposure_dt)
+        exif_bytes = piexif.dump({"Exif": {
+            piexif.ExifIFD.ExposureTime:    (shutter_us, 1_000_000),
+            piexif.ExifIFD.ISOSpeedRatings: round(gain * 100),
+        }})
+        with save_lock:
+            dropped = len(save_queue) == save_queue.maxlen
+            save_queue.append((roi_frame, fname, exif_bytes))
+        save_event.set()
+        if verbose:
+            if dropped:
+                print("WARNING: save buffer full, oldest frame dropped")
+            print(fname)
+        event_fnames.append(fname)
+
+    # CoM tracking (always, regardless of backlog)
+    col_sums = diff_mask.sum(axis=0).astype(float)
+    if col_sums.sum() > 0:
+        com_x = np.average(np.arange(diff_mask.shape[1]), weights=col_sums)
+        event_com_x_list.append(LORES_X1 + com_x)
+
+    # Update event accumulators
+    event_frame_count += 1
+    event_shutter_sum += shutter_us
+    event_gain_sum    += gain
+    if changed > event_max_px:
+        event_max_px = changed
+        if roi_frame is not None:
+            event_peak_fname = os.path.basename(fname)
+    event_last_px = changed
+
+
+def _handle_summary():
+    """Print periodic brightness summary and switch day/night mode if warranted."""
+    global bg_accum, bg_count, summary_frame
+    global day_candidate_count, night_candidate_count
+
+    summary_frame += 1
+    if summary_frame < SUMMARY_INTERVAL:
+        return
+
+    if bg_count > 0:
+        bg_avg   = bg_accum / bg_count
+        mode_str = "NIGHT" if is_night_mode else "DAY"
+        if verbose:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [{mode_str}] bg brightness avg: {bg_avg:.1f}"
+                  f"  ({bg_count}/{SUMMARY_INTERVAL} non-motion frames)  thr={threshold}")
+
+        going_day   = is_night_mode     and bg_avg >= DAY_THRESHOLD
+        going_night = not is_night_mode and bg_avg <= NIGHT_THRESHOLD
+
+        if going_day:
+            day_candidate_count += 1
+            night_candidate_count = 0
+        elif going_night:
+            night_candidate_count += 1
+            day_candidate_count = 0
+        else:
+            day_candidate_count = night_candidate_count = 0
+
+        if verbose and going_day:
+            print(f"  Day candidate {day_candidate_count}/{SWITCH_INTERVALS}")
+        if verbose and going_night:
+            print(f"  Night candidate {night_candidate_count}/{SWITCH_INTERVALS}")
+
+        if going_day and day_candidate_count >= SWITCH_INTERVALS:
+            apply_day_mode(picam2)
+            day_candidate_count = 0
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Switched to DAY mode")
+        elif going_night and night_candidate_count >= SWITCH_INTERVALS:
+            apply_night_mode(picam2)
+            night_candidate_count = 0
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Switched to NIGHT mode")
+    else:
+        if verbose:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] bg brightness avg: n/a (all frames were motion)")
+
+    bg_accum = bg_count = summary_frame = 0
+
+
+# --- Main loop ---
+changed = 0
+
+while True:
+    # Capture the lores frame for motion detection and preview updates.
+    # This is done on every loop iteration regardless of transfer backlog, since
+    # the lores stream is lightweight; used for CoM tracking and day/night switching.
+    lores = picam2.capture_array("lores")
+    _update_preview(lores)
 
     gray_roi = lores[:480, :640][LORES_Y1:LORES_Y2, LORES_X1:LORES_X2]
 
@@ -593,124 +745,15 @@ while True:
             print(changed)
 
         if changed > threshold:
-            # Force-close event if it has exceeded the duration cap
-            if in_motion_event and (time.time() - event_t_start) > EVENT_MAX_DURATION_S:
-                _close_event(changed, is_cap=True)
-
-            # Start new event if needed (must come before event_fnames.append)
-            if not in_motion_event:
-                _start_event()
-
-            # Check transfer backlog before attempting full-res capture
-            with transfer_lock:
-                backlog = len(transfer_queue)
-            backlog_blocked = backlog >= MAX_SHM_BACKLOG
-
-            if not backlog_blocked:
-                frame     = picam2.capture_array("main")
-                roi_frame = frame[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2].copy()
-            else:
-                roi_frame = None
-
-            # Always capture metadata (no /dev/shm allocation)
-            meta         = picam2.capture_metadata()
-            now          = datetime.now()
-            shutter_us   = meta.get("ExposureTime", 0)
-            gain         = meta.get("AnalogueGain", 1.0)
-            sensor_ts_ns = meta.get("SensorTimestamp")
-
-            is_first    = not in_motion_event
-            sensor_dt   = (_wall_anchor + timedelta(seconds=(sensor_ts_ns - _sensor_anchor_ns) / 1e9)
-                           if sensor_ts_ns is not None and _sensor_anchor_ns is not None else None)
-            exposure_dt = sensor_to_exposure_start(sensor_ts_ns, is_first)
-            fname       = make_fname(exposure_dt, now)
-
-            if roi_frame is not None:
-                with _preview_lock:
-                    _preview_last_fname = os.path.basename(fname)
-
-                if SAVE_TIMING_LOG:
-                    write_timing_log(fname, now, sensor_dt, exposure_dt)
-
-                exif_bytes = piexif.dump({"Exif": {
-                    piexif.ExifIFD.ExposureTime:    (shutter_us, 1_000_000),
-                    piexif.ExifIFD.ISOSpeedRatings: round(gain * 100),
-                }})
-
-                with save_lock:
-                    dropped = len(save_queue) == save_queue.maxlen
-                    save_queue.append((roi_frame, fname, exif_bytes))
-                save_event.set()
-                if verbose:
-                    if dropped:
-                        print("WARNING: save buffer full, oldest frame dropped")
-                    print(fname)
-                event_fnames.append(fname)
-
-            # X center of mass of changed pixels in lores ROI (always, regardless of backlog)
-            col_sums = diff_mask.sum(axis=0).astype(float)
-            if col_sums.sum() > 0:
-                com_x = np.average(np.arange(diff_mask.shape[1]), weights=col_sums)
-                event_com_x_list.append(LORES_X1 + com_x)  # absolute lores x
-
-            # Update event accumulators
-            event_frame_count += 1
-            event_shutter_sum += shutter_us
-            event_gain_sum    += gain
-            if changed > event_max_px:
-                event_max_px = changed
-                if roi_frame is not None:
-                    event_peak_fname = os.path.basename(fname)
-            event_last_px = changed
-
+            _handle_motion_frame(changed, gray_roi, diff_mask)
         else:
-            # Non-motion frame
             if in_motion_event:
                 _close_event(changed)
             bg_accum += float(np.mean(gray_roi))
             bg_count += 1
             event_last_px = changed
 
-        summary_frame += 1
-        if summary_frame >= SUMMARY_INTERVAL:
-            if bg_count > 0:
-                bg_avg   = bg_accum / bg_count
-                mode_str = "NIGHT" if is_night_mode else "DAY"
-                if verbose:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] [{mode_str}] bg brightness avg: {bg_avg:.1f}"
-                          f"  ({bg_count}/{SUMMARY_INTERVAL} non-motion frames)  thr={threshold}")
-
-                # Unified day/night switching logic
-                going_day   = is_night_mode     and bg_avg >= DAY_THRESHOLD
-                going_night = not is_night_mode and bg_avg <= NIGHT_THRESHOLD
-
-                if going_day:
-                    day_candidate_count += 1
-                    night_candidate_count = 0
-                elif going_night:
-                    night_candidate_count += 1
-                    day_candidate_count = 0
-                else:
-                    day_candidate_count = night_candidate_count = 0
-
-                if verbose and going_day:
-                    print(f"  Day candidate {day_candidate_count}/{SWITCH_INTERVALS}")
-                if verbose and going_night:
-                    print(f"  Night candidate {night_candidate_count}/{SWITCH_INTERVALS}")
-
-                if going_day and day_candidate_count >= SWITCH_INTERVALS:
-                    apply_day_mode(picam2)
-                    day_candidate_count = 0
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Switched to DAY mode")
-                elif going_night and night_candidate_count >= SWITCH_INTERVALS:
-                    apply_night_mode(picam2)
-                    night_candidate_count = 0
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Switched to NIGHT mode")
-            else:
-                if verbose:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] bg brightness avg: n/a (all frames were motion)")
-
-            bg_accum = bg_count = summary_frame = 0
+        _handle_summary()
 
     prev_gray = gray_roi
     time.sleep(0.05)
