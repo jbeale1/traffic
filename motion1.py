@@ -9,10 +9,11 @@
 # filters out noise/tree events by requiring minimum CoM displacement or velocity
 # custom AeExposureMode limits longest shutter speed to 2 msec
 
-# J.Beale 2026-04-18
+# J.Beale 2026-04-24
 
 import os
 import glob
+import json
 import piexif
 from PIL import Image
 import cv2
@@ -38,12 +39,32 @@ from config import (REMOTE_HOST, REMOTE_DIR, LOG_DIR, TUNING_FILE,
 TRANSFER_BUFFER_SIZE   = 64     # max queued filenames (each ~1.3 MB in /dev/shm)
 TRANSFER_MAX_RETRIES   = 3      # give up after this many consecutive rsync failures
 SAVE_BUFFER_SIZE       = 12
-MAX_SHM_BACKLOG        = 20     # pause full-res saves if transfer queue exceeds this
+MAX_SHM_BACKLOG        = 40     # pause full-res saves if transfer queue exceeds this
+MIN_SAVE_INTERVAL_S    = 0.6    # minimum seconds between full-res saves during an event
 
-SHM_DIR                = "/dev/shm/cam9"  # working directory for full-res JPEGs
+SHM_DIR                = "/dev/shm/cam2"  # working directory for full-res JPEGs
 SHM_STALE_HOURS        = 1               # delete leftover JPEGs older than this on startup
+SD_SAVE_DIR            = "/home/pi/CAM2/saved"  # fallback destination when ethernet absent
 
-EVENT_MAX_DURATION_S   = 5.0    # force-close an event after this many seconds
+def _eth_has_ip(iface="eth0"):
+    """Return True if the given interface has an active IPv4 address."""
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "addr", "show", iface],
+            capture_output=True, text=True, timeout=5
+        )
+        return "inet " in result.stdout
+    except Exception:
+        return False
+
+LOCAL_SAVE_MODE = not _eth_has_ip("eth0")
+if LOCAL_SAVE_MODE:
+    print("[startup] No ethernet IP detected — saving to SD card, rsync disabled")
+    os.makedirs(SD_SAVE_DIR, exist_ok=True)
+else:
+    print("[startup] Ethernet active — saving to /dev/shm and rsyncing as normal")
+
+EVENT_MAX_DURATION_S   = 8.0    # force-close an event after this many seconds
 EVENT_MIN_DISPLACEMENT = 262    # lores px: min CoM range to keep event (half ROI width)
 EVENT_MIN_VELOCITY     = 5.0    # lores px/frame: min |velocity| to keep event
 
@@ -52,6 +73,14 @@ LORES_X1 = round(ROI_X1 * 640 / 4056)
 LORES_Y1 = round(ROI_Y1 * 480 / 3040)
 LORES_X2 = round(ROI_X2 * 640 / 4056)
 LORES_Y2 = round(ROI_Y2 * 480 / 3040)
+
+# Focus-mode hardware ROI: central 1/3 of the normal ROI in sensor coordinates
+_roi_w = ROI_X2 - ROI_X1
+_roi_h = ROI_Y2 - ROI_Y1
+FOCUS_ROI_X1 = ROI_X1 + _roi_w // 3
+FOCUS_ROI_Y1 = ROI_Y1 + _roi_h // 3
+FOCUS_ROI_X2 = ROI_X1 + _roi_w * 2 // 3
+FOCUS_ROI_Y2 = ROI_Y1 + _roi_h * 2 // 3
 
 # Day/night switching thresholds and parameters
 MAX_SHUTTER_US     = 2000   # night mode fixed shutter (usec)
@@ -84,6 +113,11 @@ verbose       = False
 is_night_mode = False  # start in day mode
 threshold     = THRESHOLD_DAY
 prev_gray     = None
+focus_mode      = False  # when True, preview shows central 1/3 of ROI
+motion_enabled  = True   # when False, motion events are detected but not saved
+use_shm_mode    = False  # when True, override LOCAL_SAVE_MODE and push via rsync
+_manual_capture_fname = ""   # basename of last manual capture, shown in status
+_manual_capture_time  = 0.0  # wall time of last manual capture
 
 bg_accum              = 0.0
 bg_count              = 0
@@ -99,6 +133,7 @@ event_max_px        = 0
 event_peak_fname    = ""
 event_pre_px        = 0
 event_last_px       = 0
+_last_save_time     = 0.0    # wall time of last full-res capture
 event_shutter_sum   = 0.0
 event_gain_sum      = 0.0
 event_bg_brightness = 0.0
@@ -106,7 +141,9 @@ event_com_x_list    = []
 event_fnames        = []   # filenames saved during this event
 
 _preview_last_fname = ""   # last motion-triggered filename
+_preview_changed    = 0    # most recent motion pixel count
 _preview_timestamp  = ""   # timestamp of last preview frame
+_preview_seq        = 0    # increments each time a new JPEG is encoded
 _preview_event_log  = deque()  # (event_end_time, frame_count) tuples
 
 
@@ -137,11 +174,12 @@ def _close_event(changed, is_cap=False):
     keep            = _event_passes_filter(event_com_x_list)
 
     if keep:
-        with transfer_lock:
-            for fn in event_fnames:
-                transfer_queue.append(fn)
-        if event_fnames:
-            transfer_event.set()
+        if not LOCAL_SAVE_MODE or use_shm_mode:
+            with transfer_lock:
+                for fn in event_fnames:
+                    transfer_queue.append(fn)
+            if event_fnames:
+                transfer_event.set()
         with _preview_lock:
             _preview_event_log.append((time.time(), event_frame_count))
     else:
@@ -374,6 +412,88 @@ class _PreviewHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # suppress access log noise
 
+    def do_POST(self):
+        global focus_mode, _manual_capture_fname, _manual_capture_time, motion_enabled, use_shm_mode
+        path = self.path.split("?")[0]
+
+        def _state_json():
+            return json.dumps({
+                "motion": motion_enabled,
+                "focus":  focus_mode,
+                "shm":    use_shm_mode,
+                "local":  LOCAL_SAVE_MODE,
+            }).encode()
+
+        def _send_json(body):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        if path == "/shmmode":
+            if LOCAL_SAVE_MODE:
+                use_shm_mode = not use_shm_mode
+                if use_shm_mode:
+                    os.makedirs(SHM_DIR, exist_ok=True)
+            _send_json(_state_json())
+
+        elif path == "/enable":
+            motion_enabled = not motion_enabled
+            _send_json(_state_json())
+
+        elif path == "/focus":
+            focus_mode = not focus_mode
+            if focus_mode:
+                picam2.set_controls({"ScalerCrop": (
+                    FOCUS_ROI_X1, FOCUS_ROI_Y1,
+                    FOCUS_ROI_X2 - FOCUS_ROI_X1,
+                    FOCUS_ROI_Y2 - FOCUS_ROI_Y1,
+                )})
+            else:
+                picam2.set_controls({"ScalerCrop": (
+                    ROI_X1, ROI_Y1,
+                    ROI_X2 - ROI_X1,
+                    ROI_Y2 - ROI_Y1,
+                )})
+            _send_json(_state_json())
+
+        elif path == "/capture":
+            now = datetime.now()
+            ms  = now.microsecond // 1000
+            save_dir = current_save_dir()
+            fname = os.path.join(save_dir,
+                                 f"{now.strftime('%Y%m%d_%H%M%S')}_{ms:03d}_C.jpg")
+            try:
+                frame     = picam2.capture_array("main")
+                if focus_mode:
+                    roi_frame = frame[FOCUS_ROI_Y1:FOCUS_ROI_Y2,
+                                      FOCUS_ROI_X1:FOCUS_ROI_X2].copy()
+                else:
+                    roi_frame = frame[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2].copy()
+                img_pil = Image.fromarray(cv2.cvtColor(roi_frame, cv2.COLOR_BGR2RGB))
+                img_pil.save(fname, "JPEG", quality=92)
+                bname = os.path.basename(fname)
+                with _preview_lock:
+                    _manual_capture_fname = bname
+                    _manual_capture_time  = time.time()
+                if not LOCAL_SAVE_MODE or use_shm_mode:
+                    with transfer_lock:
+                        transfer_queue.append(fname)
+                    transfer_event.set()
+                body = bname.encode()
+                self.send_response(200)
+            except Exception as e:
+                body = str(e).encode()
+                self.send_response(500)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        else:
+            self.send_error(404)
+
     def do_GET(self):
         path = self.path.split("?")[0]  # strip query string
 
@@ -403,23 +523,44 @@ class _PreviewHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
 
+        elif path == "/state":
+            state = {
+                "motion":  motion_enabled,
+                "focus":   focus_mode,
+                "shm":     use_shm_mode,
+                "local":   LOCAL_SAVE_MODE,
+            }
+            body = json.dumps(state).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+
         elif path == "/status":
+            now = time.time()
             with _preview_lock:
-                ts     = _preview_timestamp
-                fname  = _preview_last_fname
-                now    = time.time()
+                ts        = _preview_timestamp
+                fname     = _preview_last_fname
+                cap_fname = _manual_capture_fname
+                cap_time  = _manual_capture_time
+                px        = _preview_changed
+                seq       = _preview_seq
                 cutoff = now - 3600
                 recent = [(t, n) for t, n in _preview_event_log if t > cutoff]
-                # prune old entries while we have the lock
                 while _preview_event_log and _preview_event_log[0][0] <= cutoff:
                     _preview_event_log.popleft()
+            if cap_fname and (now - cap_time) > 10:
+                cap_fname = ""
             with transfer_lock:
                 backlog = len(transfer_queue)
             n_events = len(recent)
             n_frames = sum(n for _, n in recent)
             backlog_str = f"  BACKLOG:{backlog}" if backlog >= MAX_SHM_BACKLOG else ""
-            body = (f"{ts} | {changed} | last: {fname or '(none yet)'}"
-                    f" | {n_events}/{n_frames}{backlog_str}").encode()
+            cap_str     = f"  CAP:{cap_fname}" if cap_fname else ""
+            body = (f"seq:{seq} | {ts} | px:{px} | last: {fname or '(none yet)'}"
+                    f" | {n_events}/{n_frames}{backlog_str}{cap_str}").encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
@@ -428,10 +569,11 @@ class _PreviewHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
         elif path in ("/", "/stream"):
-            html = b"""<!DOCTYPE html>
+            shm_btn = '<button id="shmbtn" class="btn" onclick="toggleShm()">SHM OFF</button>' if LOCAL_SAVE_MODE else ''
+            html = """<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
-<title>CAM9 Preview</title>
+<title>CAM2 Preview</title>
 <style>
   body { background:#111; color:#ccc; font-family:monospace;
          display:flex; flex-direction:column; align-items:center;
@@ -439,19 +581,93 @@ class _PreviewHandler(BaseHTTPRequestHandler):
   img  { max-width:100%; border:1px solid #444; display:block; }
   #timeline { width:640px; height:10px; display:block; margin-top:2px; border:1px solid #333; }
   #status { margin-top:6px; font-size:14px; letter-spacing:0.03em; }
+  .btn { margin-top:8px; padding:6px 18px; font-family:monospace; font-size:14px;
+         background:#333; color:#ccc; border:1px solid #666; cursor:pointer; margin-right:6px; }
+  #focusbtn.active   { background:#554400; color:#ffcc00; border-color:#aa8800; }
+  #enablebtn.inactive { background:#550000; color:#ff6666; border-color:#aa0000; }
+  #shmbtn.active     { background:#003355; color:#66ccff; border-color:#0077aa; }
 </style>
 </head><body>
 <img src="/snapshot" id="feed">
 <img src="/timeline" id="timeline">
 <div id="status">connecting...</div>
+<div>
+<button id="enablebtn" class="btn" onclick="toggleEnable()">Motion ON</button>
+<button id="focusbtn"  class="btn" onclick="toggleFocus()">Focus OFF</button>
+<button id="capturebtn" class="btn" onclick="doCapture()">Capture</button>
+SHMBTN_PLACEHOLDER
+</div>
 <script>
-  setInterval(function(){
-    var ts = Date.now();
-    document.getElementById("feed").src     = "/snapshot?_=" + ts;
-    document.getElementById("timeline").src = "/timeline?_=" + ts;
-    fetch("/status?_=" + ts)
+  var lastSeq = -1;
+
+  function applyState(s) {
+    var eb = document.getElementById("enablebtn");
+    if (s.motion) { eb.textContent = "Motion ON";  eb.classList.remove("inactive"); }
+    else          { eb.textContent = "Motion OFF"; eb.classList.add("inactive"); }
+
+    var fb = document.getElementById("focusbtn");
+    if (s.focus) { fb.textContent = "Focus ON";  fb.classList.add("active"); }
+    else         { fb.textContent = "Focus OFF"; fb.classList.remove("active"); }
+
+    var sb = document.getElementById("shmbtn");
+    if (sb) {
+      if (s.shm) { sb.textContent = "SHM ON";  sb.classList.add("active"); }
+      else       { sb.textContent = "SHM OFF"; sb.classList.remove("active"); }
+    }
+  }
+
+  // Fetch server state once on load to sync button visuals
+  fetch("/state")
+    .then(r => r.json())
+    .then(applyState)
+    .catch(() => {});
+
+  function toggleEnable() {
+    fetch("/enable", {method:"POST"})
+      .then(r => r.json())
+      .then(applyState)
+      .catch(() => {});
+  }
+
+  function toggleFocus() {
+    fetch("/focus", {method:"POST"})
+      .then(r => r.json())
+      .then(applyState)
+      .catch(() => {});
+  }
+
+  function toggleShm() {
+    fetch("/shmmode", {method:"POST"})
+      .then(r => r.json())
+      .then(applyState)
+      .catch(() => {});
+  }
+
+  function doCapture() {
+    fetch("/capture", {method:"POST"})
       .then(r => r.text())
-      .then(t => { document.getElementById("status").textContent = t; })
+      .then(function(s) {
+        document.getElementById("status").textContent = "Captured: " + s;
+      })
+      .catch(() => {});
+  }
+
+  setInterval(function(){
+    fetch("/status")
+      .then(r => r.text())
+      .then(function(t) {
+        document.getElementById("status").textContent = t;
+        var m = t.match(/seq:(\\d+)/);
+        if (m) {
+          var seq = parseInt(m[1]);
+          if (seq !== lastSeq) {
+            lastSeq = seq;
+            var ts = Date.now();
+            document.getElementById("feed").src     = "/snapshot?_=" + ts;
+            document.getElementById("timeline").src = "/timeline?_=" + ts;
+          }
+        }
+      })
       .catch(() => {});
   }, 1000);
 
@@ -464,9 +680,10 @@ class _PreviewHandler(BaseHTTPRequestHandler):
 </body></html>"""
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
-            self.send_header("Content-Length", str(len(html)))
+            html_bytes = html.replace("SHMBTN_PLACEHOLDER", shm_btn).encode()
+            self.send_header("Content-Length", str(len(html_bytes)))
             self.end_headers()
-            self.wfile.write(html)
+            self.wfile.write(html_bytes)
 
         else:
             self.send_error(404)
@@ -481,7 +698,16 @@ print(f"Preview server on port {PREVIEW_PORT}  /snapshot or /stream")
 
 
 # --- Camera setup ---
-picam2 = Picamera2(tuning=Picamera2.load_tuning_file(TUNING_FILE))
+# On Pi 5 with dual camera ports the camera may not be index 0.
+# Find the camera attached to "cam0" by checking global_camera_info(); fall back to 0.
+def _find_camera_num(port="cam0"):
+    for info in Picamera2.global_camera_info():
+        if port in str(info.get("Id", "")).lower():
+            return info["Num"]
+    return 0
+
+_cam_num = _find_camera_num("cam0")
+picam2 = Picamera2(_cam_num, tuning=Picamera2.load_tuning_file(TUNING_FILE))
 
 # Note: picam2 misleadingly names RGB888 as BGR888 and vice-versa
 config = picam2.create_still_configuration(
@@ -543,12 +769,16 @@ def sensor_to_exposure_start(sensor_ts_ns, is_first_frame):
     sensor_dt  = _wall_anchor + timedelta(seconds=(sensor_ts_ns - _sensor_anchor_ns) / 1e9)
     return sensor_dt - timedelta(milliseconds=latency_ms)
 
+def current_save_dir():
+    """Return the active save directory based on mode flags."""
+    return SD_SAVE_DIR if (LOCAL_SAVE_MODE and not use_shm_mode) else SHM_DIR
+
 def make_fname(exposure_dt, wall_dt):
-    """Return SHM_DIR filename based on corrected exposure-start time,
+    """Return filename based on corrected exposure-start time,
     falling back to wall-clock time if sensor data is unavailable."""
     dt = exposure_dt if exposure_dt is not None else wall_dt
     ms = dt.microsecond // 1000
-    return os.path.join(SHM_DIR, f"{dt.strftime('%Y%m%d_%H%M%S')}_{ms:03d}.jpg")
+    return os.path.join(current_save_dir(), f"{dt.strftime('%Y%m%d_%H%M%S')}_{ms:03d}.jpg")
 
 def write_timing_log(fname, wall_dt, sensor_dt, exposure_dt):
     """Append one row per saved frame with wall, raw-sensor, and corrected exposure times."""
@@ -584,20 +814,28 @@ def write_timing_log(fname, wall_dt, sensor_dt, exposure_dt):
 def _update_preview(lores):
     """Update the snapshot JPEG and timeline PNG at their respective rates."""
     global _preview_frame_count, _preview_timeline_counter
-    global _preview_jpeg, _preview_timestamp
+    global _preview_jpeg, _preview_timestamp, _preview_seq
 
     _preview_frame_count += 1
     if _preview_frame_count >= PREVIEW_EVERY:
         _preview_frame_count = 0
         bgr_full    = cv2.cvtColor(lores, cv2.COLOR_YUV2BGR_I420)
-        # bgr_preview = bgr_full[:480, :640] # full sensor frame area in lores
-        bgr_preview = bgr_full[:480, :640][LORES_Y1:LORES_Y2, LORES_X1:LORES_X2] # cropped (ROI) in lores
+        roi_img     = bgr_full[:480, :640][LORES_Y1:LORES_Y2, LORES_X1:LORES_X2]
+        if focus_mode:
+            rh, rw   = roi_img.shape[:2]
+            fx1, fy1 = rw // 3, rh // 3
+            fx2, fy2 = fx1 * 2, fy1 * 2
+            crop     = roi_img[fy1:fy2, fx1:fx2]
+            bgr_preview = cv2.resize(crop, (rw, rh), interpolation=cv2.INTER_LINEAR)
+        else:
+            bgr_preview = roi_img
 
         ok, jpg_buf = cv2.imencode(".jpg", bgr_preview, [cv2.IMWRITE_JPEG_QUALITY, 70])
         if ok:
             with _preview_lock:
                 _preview_jpeg      = jpg_buf.tobytes()
                 _preview_timestamp = datetime.now().strftime("%H:%M:%S")
+                _preview_seq      += 1
 
     _preview_timeline_counter += 1
     if _preview_timeline_counter >= TIMELINE_REGEN_FRAMES:
@@ -608,7 +846,7 @@ def _handle_motion_frame(changed, gray_roi, diff_mask):
     """Process one lores frame that exceeded the motion threshold."""
     global event_max_px, event_frame_count, event_shutter_sum
     global event_gain_sum, event_last_px, event_peak_fname
-    global _preview_last_fname
+    global _preview_last_fname, _last_save_time
 
     # Force-close event if it has exceeded the duration cap
     if in_motion_event and (time.time() - event_t_start) > EVENT_MAX_DURATION_S:
@@ -618,14 +856,19 @@ def _handle_motion_frame(changed, gray_roi, diff_mask):
     if not in_motion_event:
         _start_event()
 
-    # Check transfer backlog before attempting full-res capture
+    # ==================================================================
+
+    # Check transfer backlog and save-rate limit before full-res capture
     with transfer_lock:
         backlog = len(transfer_queue)
-    backlog_blocked = backlog >= MAX_SHM_BACKLOG
+    backlog_blocked  = backlog >= MAX_SHM_BACKLOG
+    now_t            = time.time()
+    interval_ok      = (now_t - _last_save_time) >= MIN_SAVE_INTERVAL_S
 
-    if not backlog_blocked:
+    if not backlog_blocked and interval_ok and not focus_mode and motion_enabled:
         frame     = picam2.capture_array("main")
         roi_frame = frame[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2].copy()
+        _last_save_time = now_t
     else:
         roi_frame = None
 
@@ -727,7 +970,7 @@ def _handle_summary():
 
 
 # --- Main loop ---
-changed = 0
+changed    = 0
 
 while True:
     # Capture the lores frame for motion detection and preview updates.
@@ -740,7 +983,10 @@ while True:
 
     if prev_gray is not None:
         diff_mask = cv2.absdiff(gray_roi, prev_gray) > 25
+        diff_mask = cv2.erode(diff_mask.astype(np.uint8),
+                              np.ones((3, 3), np.uint8), iterations=1).astype(bool)
         changed   = np.sum(diff_mask)
+        _preview_changed = changed
         if verbose and changed > 5:
             print(changed)
 
