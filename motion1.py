@@ -937,7 +937,8 @@ def _handle_motion_frame(changed, gray_roi, diff_mask):
         exif_bytes = piexif.dump({"Exif": {
             piexif.ExifIFD.ExposureTime:    (shutter_us, 1_000_000),
             piexif.ExifIFD.ISOSpeedRatings: round(gain * 100),
-        }})
+            piexif.ExifIFD.Temperature:     (round(_cpu_temp_filtered * 10), 10),  # e.g. 47.3°C -> (473, 10)
+        }})            
         with save_lock:
             dropped = len(save_queue) == save_queue.maxlen
             save_queue.append((roi_frame, fname, exif_bytes))
