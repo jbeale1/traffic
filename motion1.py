@@ -156,7 +156,9 @@ _preview_changed    = 0    # most recent motion pixel count
 _preview_timestamp  = ""   # timestamp of last preview frame
 _preview_seq        = 0    # increments each time a new JPEG is encoded
 _preview_event_log  = deque()  # (event_end_time, frame_count) tuples
-_preview_last_update_t = 0.0
+_preview_last_update_t = 0.0   # wall time when preview JPEG was last updated
+_cpu_temp_filtered = 0.0   # exponentially smoothed CPU temperature (°C)
+
 
 # ---------------------------------------------------------------------------
 # Event filter and open/close helpers
@@ -374,6 +376,33 @@ def transfer_thread():
 
 threading.Thread(target=transfer_thread, daemon=True).start()
 
+# --- CPU temperature monitoring ---
+def _read_cpu_temp():
+    """Read CPU temp via vcgencmd; return float °C or None on error."""
+    try:
+        result = subprocess.run(
+            ["vcgencmd", "measure_temp"],
+            capture_output=True, text=True, timeout=3
+        )
+        # output is e.g. "temp=47.2'C\n"
+        val = result.stdout.strip()
+        return float(val.split("=")[1].split("'")[0])
+    except Exception:
+        return None
+
+def _temp_monitor_thread():
+    global _cpu_temp_filtered
+    t = _read_cpu_temp()
+    if t is not None:
+        _cpu_temp_filtered = t
+    while True:
+        time.sleep(10)
+        t = _read_cpu_temp()
+        if t is not None:
+            _cpu_temp_filtered = 0.9 * _cpu_temp_filtered + 0.1 * t
+
+threading.Thread(target=_temp_monitor_thread, daemon=True).start()
+
 # --- Preview server ---
 
 PREVIEW_PORT          = 8080
@@ -572,7 +601,8 @@ class _PreviewHandler(BaseHTTPRequestHandler):
             backlog_str = f"  BACKLOG:{backlog}" if backlog >= MAX_SHM_BACKLOG else ""
             cap_str     = f"  CAP:{cap_fname}" if cap_fname else ""
             body = (f"{ts} | px:{px} | seq:{seq} | last: {fname or '(none yet)'}"
-                    f" | {n_events}/{n_frames}{backlog_str}{cap_str}").encode()
+                    f" | {n_events}/{n_frames}{backlog_str}{cap_str}"
+                    f" | {_cpu_temp_filtered:.1f}°C").encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
