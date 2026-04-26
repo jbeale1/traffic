@@ -497,6 +497,8 @@ class _PreviewHandler(BaseHTTPRequestHandler):
                     ROI_X2 - ROI_X1,
                     ROI_Y2 - ROI_Y1,
                 )})
+            global prev_gray
+            prev_gray = None  # discard stale frame from previous crop geometry
             _send_json(_state_json())
 
         elif path == "/capture":
@@ -762,6 +764,7 @@ config["colour_space"] = ColorSpace.Srgb()
 picam2.configure(config)
 picam2.start()
 apply_day_mode(picam2)
+picam2.set_controls({"ScalerCrop": (ROI_X1, ROI_Y1, ROI_X2 - ROI_X1, ROI_Y2 - ROI_Y1)})
 time.sleep(5)
 
 metadata = picam2.capture_metadata()
@@ -863,13 +866,14 @@ def _update_preview(lores):
     now_t = time.time()
     if now_t - _preview_last_update_t >= 1.0:
         _preview_last_update_t = math.floor(now_t)
-        bgr_full    = cv2.cvtColor(lores, cv2.COLOR_YUV2BGR_I420)
-        roi_img     = bgr_full[:480, :640][LORES_Y1:LORES_Y2, LORES_X1:LORES_X2]
+        bgr_full = cv2.cvtColor(lores, cv2.COLOR_YUV2BGR_I420)
+        roi_img  = bgr_full[:480, :640]   # full lores = ScalerCrop region = ROI
+
         if focus_mode:
             rh, rw   = roi_img.shape[:2]
             fx1, fy1 = rw // 3, rh // 3
             fx2, fy2 = fx1 * 2, fy1 * 2
-            crop     = roi_img[fy1:fy2, fx1:fx2]
+            crop        = roi_img[fy1:fy2, fx1:fx2]
             bgr_preview = cv2.resize(crop, (rw, rh), interpolation=cv2.INTER_LINEAR)
         else:
             bgr_preview = roi_img
