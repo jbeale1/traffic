@@ -9,7 +9,7 @@
 # filters out noise/tree events by requiring minimum CoM displacement or velocity
 # custom AeExposureMode limits longest shutter speed to 2 msec
 
-# J.Beale 2026-04-25
+# J.Beale 2026-04-26
 
 import os
 import glob
@@ -125,6 +125,7 @@ is_night_mode = False  # start in day mode
 threshold     = THRESHOLD_DAY
 prev_gray     = None
 focus_mode      = False  # when True, preview shows central 1/3 of ROI
+change_mode     = False  # when True, preview highlights motion pixels
 motion_enabled  = True   # when False, motion events are detected but not saved
 use_shm_mode    = False  # when True, override LOCAL_SAVE_MODE and push via rsync
 _manual_capture_fname = ""   # basename of last manual capture, shown in status
@@ -454,13 +455,14 @@ class _PreviewHandler(BaseHTTPRequestHandler):
         pass  # suppress access log noise
 
     def do_POST(self):
-        global focus_mode, _manual_capture_fname, _manual_capture_time, motion_enabled, use_shm_mode
+        global focus_mode, change_mode, _manual_capture_fname, _manual_capture_time, motion_enabled, use_shm_mode
         path = self.path.split("?")[0]
 
         def _state_json():
             return json.dumps({
                 "motion": motion_enabled,
                 "focus":  focus_mode,
+                "change": change_mode,
                 "shm":    use_shm_mode,
                 "local":  LOCAL_SAVE_MODE,
             }).encode()
@@ -499,6 +501,10 @@ class _PreviewHandler(BaseHTTPRequestHandler):
                 )})
             global prev_gray
             prev_gray = None  # discard stale frame from previous crop geometry
+            _send_json(_state_json())
+
+        elif path == "/change":
+            change_mode = not change_mode
             _send_json(_state_json())
 
         elif path == "/capture":
@@ -570,6 +576,7 @@ class _PreviewHandler(BaseHTTPRequestHandler):
             state = {
                 "motion":  motion_enabled,
                 "focus":   focus_mode,
+                "change":  change_mode,
                 "shm":     use_shm_mode,
                 "local":   LOCAL_SAVE_MODE,
             }
@@ -630,6 +637,7 @@ class _PreviewHandler(BaseHTTPRequestHandler):
   #focusbtn.active   { background:#554400; color:#ffcc00; border-color:#aa8800; }
   #enablebtn.inactive { background:#550000; color:#ff6666; border-color:#aa0000; }
   #shmbtn.active     { background:#003355; color:#66ccff; border-color:#0077aa; }
+  #changebtn.active  { background:#003300; color:#00ff88; border-color:#00aa44; }
 </style>
 </head><body>
 <img src="/snapshot" id="feed">
@@ -639,6 +647,7 @@ class _PreviewHandler(BaseHTTPRequestHandler):
 <button id="enablebtn" class="btn" onclick="toggleEnable()">Motion ON</button>
 <button id="focusbtn"  class="btn" onclick="toggleFocus()">Focus OFF</button>
 <button id="capturebtn" class="btn" onclick="doCapture()">Capture</button>
+<button id="changebtn" class="btn" onclick="toggleChange()">Change OFF</button>
 SHMBTN_PLACEHOLDER
 </div>
 <script>
@@ -658,6 +667,10 @@ SHMBTN_PLACEHOLDER
       if (s.shm) { sb.textContent = "SHM ON";  sb.classList.add("active"); }
       else       { sb.textContent = "SHM OFF"; sb.classList.remove("active"); }
     }
+
+    var cb = document.getElementById("changebtn");
+    if (s.change) { cb.textContent = "Change ON";  cb.classList.add("active"); }
+    else          { cb.textContent = "Change OFF"; cb.classList.remove("active"); }
   }
 
   // Fetch server state once on load to sync button visuals
@@ -682,6 +695,13 @@ SHMBTN_PLACEHOLDER
 
   function toggleShm() {
     fetch("/shmmode", {method:"POST"})
+      .then(r => r.json())
+      .then(applyState)
+      .catch(() => {});
+  }
+
+  function toggleChange() {
+    fetch("/change", {method:"POST"})
       .then(r => r.json())
       .then(applyState)
       .catch(() => {});
@@ -857,8 +877,13 @@ def write_timing_log(fname, wall_dt, sensor_dt, exposure_dt):
                         exposure_s, exposure_hms,
                         diff_ms])
 
-def _update_preview(lores):
-    """Update the snapshot JPEG and timeline PNG at their respective rates."""
+def _update_preview(lores, diff_mask_lores=None):
+    """Update the snapshot JPEG and timeline PNG at their respective rates.
+
+    diff_mask_lores: boolean array covering the lores ROI, or None.
+    When change_mode is True and a mask is provided, motion pixels are shown
+    at full color and non-motion pixels are dimmed to half-intensity grayscale.
+    """
     global _preview_timeline_counter
     global _preview_jpeg, _preview_timestamp, _preview_seq
     global _preview_last_update_t
@@ -876,7 +901,23 @@ def _update_preview(lores):
             crop        = roi_img[fy1:fy2, fx1:fx2]
             bgr_preview = cv2.resize(crop, (rw, rh), interpolation=cv2.INTER_LINEAR)
         else:
-            bgr_preview = roi_img
+            bgr_preview = roi_img.copy()
+
+        if change_mode and diff_mask_lores is not None and not focus_mode:
+            # Resize mask to preview dimensions if they differ
+            ph, pw = bgr_preview.shape[:2]
+            mh, mw = diff_mask_lores.shape[:2]
+            if (mh, mw) != (ph, pw):
+                mask_u8   = diff_mask_lores.astype(np.uint8) * 255
+                mask_u8   = cv2.resize(mask_u8, (pw, ph), interpolation=cv2.INTER_NEAREST)
+                mask_bool = mask_u8 > 0
+            else:
+                mask_bool = diff_mask_lores
+            # Non-motion pixels: half-intensity grayscale; motion pixels: full color
+            gray      = cv2.cvtColor(bgr_preview, cv2.COLOR_BGR2GRAY)
+            gray_half = (gray.astype(np.uint16) // 2).astype(np.uint8)
+            gray_bgr  = cv2.cvtColor(gray_half, cv2.COLOR_GRAY2BGR)
+            bgr_preview = np.where(mask_bool[:, :, np.newaxis], bgr_preview, gray_bgr)
 
         ok, jpg_buf = cv2.imencode(".jpg", bgr_preview, [cv2.IMWRITE_JPEG_QUALITY, 70])
         if ok:
@@ -1026,7 +1067,6 @@ while True:
     # This is done on every loop iteration regardless of transfer backlog, since
     # the lores stream is lightweight; used for CoM tracking and day/night switching.
     lores = picam2.capture_array("lores")
-    _update_preview(lores)
 
     gray_roi = lores[:480, :640][LORES_Y1:LORES_Y2, LORES_X1:LORES_X2]
 
@@ -1061,6 +1101,9 @@ while True:
             event_last_px = changed
 
         _handle_summary()
+        _update_preview(lores, diff_mask_lores=diff_mask)
+    else:
+        _update_preview(lores)
 
     prev_gray = gray_roi
     time.sleep(0.05)
