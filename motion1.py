@@ -9,7 +9,7 @@
 # filters out noise/tree events by requiring minimum CoM displacement or velocity
 # custom AeExposureMode limits longest shutter speed to 2 msec
 
-# J.Beale 2026-04-24
+# J.Beale 2026-04-25
 
 import os
 import glob
@@ -29,18 +29,24 @@ import subprocess
 import io
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import math
 
 # get site-specific parameters
 from config import (REMOTE_HOST, REMOTE_DIR, LOG_DIR, TUNING_FILE,
                     ROI_X1, ROI_Y1, ROI_X2, ROI_Y2,
                     THRESHOLD_DAY, THRESHOLD_NIGHT,
-                    LATENCY_FIRST_MS, LATENCY_STEADY_MS)
+                    LATENCY_FIRST_MS, LATENCY_STEADY_MS,
+                    MOTION_EXCLUDE_TOP, MOTION_EXCLUDE_BOTTOM, MIN_SAVE_INTERVAL_S)
 
 TRANSFER_BUFFER_SIZE   = 64     # max queued filenames (each ~1.3 MB in /dev/shm)
 TRANSFER_MAX_RETRIES   = 3      # give up after this many consecutive rsync failures
 SAVE_BUFFER_SIZE       = 12
 MAX_SHM_BACKLOG        = 40     # pause full-res saves if transfer queue exceeds this
-MIN_SAVE_INTERVAL_S    = 0.6    # minimum seconds between full-res saves during an event
+
+EVENT_MAX_DURATION_S   = 8.0    # force-close an event after this many seconds
+EVENT_MIN_DISPLACEMENT = 262    # lores px: min CoM range to keep event (half ROI width)
+EVENT_MIN_VELOCITY     = 5.0    # lores px/frame: min |velocity| to keep event
+
 
 SHM_DIR                = "/dev/shm/cam2"  # working directory for full-res JPEGs
 SHM_STALE_HOURS        = 1               # delete leftover JPEGs older than this on startup
@@ -64,15 +70,20 @@ if LOCAL_SAVE_MODE:
 else:
     print("[startup] Ethernet active — saving to /dev/shm and rsyncing as normal")
 
-EVENT_MAX_DURATION_S   = 8.0    # force-close an event after this many seconds
-EVENT_MIN_DISPLACEMENT = 262    # lores px: min CoM range to keep event (half ROI width)
-EVENT_MIN_VELOCITY     = 5.0    # lores px/frame: min |velocity| to keep event
 
 # Corresponding ROI in lores (640x480) coordinates
 LORES_X1 = round(ROI_X1 * 640 / 4056)
 LORES_Y1 = round(ROI_Y1 * 480 / 3040)
 LORES_X2 = round(ROI_X2 * 640 / 4056)
 LORES_Y2 = round(ROI_Y2 * 480 / 3040)
+
+# Vertical exclusion zone within the lores ROI (leaf/sky noise at edges)
+_roi_lores_h       = LORES_Y2 - LORES_Y1
+EXCLUDE_TOP_ROWS   = round(_roi_lores_h * MOTION_EXCLUDE_TOP)
+EXCLUDE_BOT_ROWS   = round(_roi_lores_h * MOTION_EXCLUDE_BOTTOM)
+
+# Minimum connected blob size to count as real motion (filters leaf shimmer)
+MIN_BLOB_PIXELS    = 25
 
 # Focus-mode hardware ROI: central 1/3 of the normal ROI in sensor coordinates
 _roi_w = ROI_X2 - ROI_X1
@@ -145,7 +156,7 @@ _preview_changed    = 0    # most recent motion pixel count
 _preview_timestamp  = ""   # timestamp of last preview frame
 _preview_seq        = 0    # increments each time a new JPEG is encoded
 _preview_event_log  = deque()  # (event_end_time, frame_count) tuples
-
+_preview_last_update_t = 0.0
 
 # ---------------------------------------------------------------------------
 # Event filter and open/close helpers
@@ -366,7 +377,6 @@ threading.Thread(target=transfer_thread, daemon=True).start()
 # --- Preview server ---
 
 PREVIEW_PORT          = 8080
-PREVIEW_EVERY         = 10    # encode snapshot every Nth lores frame
 TIMELINE_REGEN_FRAMES = 56    # regenerate timeline bar every Nth lores frame
 TIMELINE_WIDTH        = 640
 TIMELINE_HEIGHT       = 10
@@ -375,9 +385,11 @@ TIMELINE_WINDOW_S     = 3600.0
 _preview_lock          = threading.Lock()
 _preview_jpeg          = b""   # latest snapshot JPEG bytes
 _preview_timeline_png  = b""   # latest timeline PNG bytes
-_preview_frame_count   = 0
 _preview_timeline_counter = 0
 
+def _trigger_timeline_rebuild():
+    t = threading.Thread(target=_build_timeline, daemon=True)
+    t.start()
 
 def _build_timeline():
     """Render a 640x10 PNG timeline of events in the past hour."""
@@ -559,7 +571,7 @@ class _PreviewHandler(BaseHTTPRequestHandler):
             n_frames = sum(n for _, n in recent)
             backlog_str = f"  BACKLOG:{backlog}" if backlog >= MAX_SHM_BACKLOG else ""
             cap_str     = f"  CAP:{cap_fname}" if cap_fname else ""
-            body = (f"seq:{seq} | {ts} | px:{px} | last: {fname or '(none yet)'}"
+            body = (f"{ts} | px:{px} | seq:{seq} | last: {fname or '(none yet)'}"
                     f" | {n_events}/{n_frames}{backlog_str}{cap_str}").encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -656,8 +668,7 @@ SHMBTN_PLACEHOLDER
     fetch("/status")
       .then(r => r.text())
       .then(function(t) {
-        document.getElementById("status").textContent = t;
-        var m = t.match(/seq:(\\d+)/);
+        var m = t.match(/seq:(\d+)/);
         if (m) {
           var seq = parseInt(m[1]);
           if (seq !== lastSeq) {
@@ -667,7 +678,9 @@ SHMBTN_PLACEHOLDER
             document.getElementById("timeline").src = "/timeline?_=" + ts;
           }
         }
+        document.getElementById("status").textContent = t.replace(/\s*\|\s*seq:\d+/, "");
       })
+
       .catch(() => {});
   }, 1000);
 
@@ -813,12 +826,13 @@ def write_timing_log(fname, wall_dt, sensor_dt, exposure_dt):
 
 def _update_preview(lores):
     """Update the snapshot JPEG and timeline PNG at their respective rates."""
-    global _preview_frame_count, _preview_timeline_counter
+    global _preview_timeline_counter
     global _preview_jpeg, _preview_timestamp, _preview_seq
+    global _preview_last_update_t
 
-    _preview_frame_count += 1
-    if _preview_frame_count >= PREVIEW_EVERY:
-        _preview_frame_count = 0
+    now_t = time.time()
+    if now_t - _preview_last_update_t >= 1.0:
+        _preview_last_update_t = math.floor(now_t)
         bgr_full    = cv2.cvtColor(lores, cv2.COLOR_YUV2BGR_I420)
         roi_img     = bgr_full[:480, :640][LORES_Y1:LORES_Y2, LORES_X1:LORES_X2]
         if focus_mode:
@@ -840,7 +854,7 @@ def _update_preview(lores):
     _preview_timeline_counter += 1
     if _preview_timeline_counter >= TIMELINE_REGEN_FRAMES:
         _preview_timeline_counter = 0
-        _build_timeline()
+        _trigger_timeline_rebuild()
 
 def _handle_motion_frame(changed, gray_roi, diff_mask):
     """Process one lores frame that exceeded the motion threshold."""
@@ -983,8 +997,20 @@ while True:
 
     if prev_gray is not None:
         diff_mask = cv2.absdiff(gray_roi, prev_gray) > 25
-        diff_mask = cv2.erode(diff_mask.astype(np.uint8),
-                              np.ones((3, 3), np.uint8), iterations=1).astype(bool)
+        # Zero out excluded top and bottom strips
+        if EXCLUDE_TOP_ROWS > 0:
+            diff_mask[:EXCLUDE_TOP_ROWS, :] = False
+        if EXCLUDE_BOT_ROWS > 0:
+            diff_mask[-EXCLUDE_BOT_ROWS:, :] = False
+        # Remove blobs smaller than MIN_BLOB_PIXELS
+        n_labels, _, stats, _ = cv2.connectedComponentsWithStats(
+            diff_mask.astype(np.uint8), connectivity=8)
+        for label in range(1, n_labels):  # skip background label 0
+            if stats[label, cv2.CC_STAT_AREA] < MIN_BLOB_PIXELS:
+                diff_mask[stats[label, cv2.CC_STAT_TOP]:
+                          stats[label, cv2.CC_STAT_TOP] + stats[label, cv2.CC_STAT_HEIGHT],
+                          stats[label, cv2.CC_STAT_LEFT]:
+                          stats[label, cv2.CC_STAT_LEFT] + stats[label, cv2.CC_STAT_WIDTH]] = False
         changed   = np.sum(diff_mask)
         _preview_changed = changed
         if verbose and changed > 5:
