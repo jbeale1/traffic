@@ -89,6 +89,9 @@ BG_SHADOW_BOTTOM_FRAC = 0.10   # fraction of mask height to treat as the shadow 
 BG_SHADOW_DARK_MARGIN = 8      # shadow pixel must be darker than bg by at least this DN
 BG_GROUND_MARGIN_PX = 8   # rows below the vehicle floor to tolerate (wheels dip here)
 
+FRINGE_EDGE_THRESHOLD = 20     # minimum G-channel gradient magnitude (DN) to include a pixel
+                               # in the demosaic fringe score; lower = more sensitive to noise
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -382,6 +385,40 @@ def load_frame(npy_path: Path) -> np.ndarray:
     Despite being labelled BGR888 in picamera2, the main stream array is
     actually RGB-ordered in memory — see https://forums.raspberrypi.com/viewtopic.php?t=397177"""
     return np.load(str(npy_path))
+
+
+def compute_fringe_score(rgb: np.ndarray,
+                         edge_threshold: int = FRINGE_EDGE_THRESHOLD) -> float:
+    """Return a demosaic fringe score for a full-resolution RGB frame.
+
+    At each pixel, a debayer zipper artifact manifests as R or B channels
+    transitioning across an edge one pixel earlier or later than G.  This
+    is measured as the horizontal gradient disagreement between channels:
+
+        fringe = |dR/dx - dG/dx| + |dB/dx - dG/dx|
+
+    evaluated only at pixels where the G-channel gradient magnitude exceeds
+    edge_threshold (to exclude flat/noise regions from the average).
+
+    Returns the mean fringe value over all qualifying edge pixels, or 0.0
+    if no edge pixels exceed the threshold.
+    """
+    r = rgb[:, :, 0].astype(np.int16)
+    g = rgb[:, :, 1].astype(np.int16)
+    b = rgb[:, :, 2].astype(np.int16)
+
+    # Horizontal gradients via simple 1-pixel finite difference (fast, Bayer-cell aligned)
+    dr = np.abs(r[:, 1:] - r[:, :-1])
+    dg = np.abs(g[:, 1:] - g[:, :-1])
+    db = np.abs(b[:, 1:] - b[:, :-1])
+
+    edge_mask = dg > edge_threshold
+    n_edge = int(edge_mask.sum())
+    if n_edge == 0:
+        return 0.0
+
+    fringe = (np.abs(dr - dg) + np.abs(db - dg)).astype(np.float32)
+    return float(fringe[edge_mask].mean())
 
 def rsync_file(local_path: Path) -> bool:
     global _rsync_proc
@@ -855,7 +892,7 @@ def parse_args():
     p.add_argument("--shutter",    type=int,   default=None,  help="Exposure time µs")
     p.add_argument("--gain",       type=float, default=None,  help="Analogue gain")
     p.add_argument("--tune", type=str,
-                   default=str(Path(__file__).parent / "imx477_pisp.json"),
+                   default=str(Path(__file__).parent / "custom_pisp.json"),
                    help="Tuning JSON path")
     p.add_argument("--threshold",  type=float, default=4.0,   help="Z-score threshold")
     p.add_argument("--cooldown",   type=float, default=0.8,   help="Post-burst cooldown s")
@@ -889,6 +926,7 @@ def main():
     kwargs = {}
     if args.tune:
         kwargs["tuning"] = Picamera2.load_tuning_file(args.tune)
+        log.info("[tuning] loaded tuning file: %s", args.tune)
 
     picam2 = Picamera2(**kwargs)
 
@@ -990,10 +1028,18 @@ def main():
 
             free_mb = shm_free_mb()
             if free_mb >= args.shm_min_mb:
-                np.save(str(cur_npy), request.make_array("main"))
+                main_arr = request.make_array("main")
+                np.save(str(cur_npy), main_arr)
                 cur_frame = (cur_npy, meta)
             else:
+                main_arr = None
                 cur_frame = None   # can't save; treat as dropped frame
+
+            # Fringe score: only during events, only on vehicle frames (not the
+            # background frame which is event_frame_count == 1).
+            fringe = None
+            if in_event and event_frame_count > 1 and main_arr is not None:
+                fringe = compute_fringe_score(main_arr)
 
         finally:
             # Release the camera request immediately — pixel data is in shm now
@@ -1076,7 +1122,8 @@ def main():
                 cooldown_until    = now + args.cooldown
                 continue
 
-            log.info("  event frame %d  %s", event_frame_count, reason)
+            fringe_tag = f"  fringe={fringe:.2f}" if fringe is not None else ""
+            log.info("  event frame %d  %s%s", event_frame_count, reason, fringe_tag)
 
             if not occupied:
                 # Vehicle has cleared all zones.
