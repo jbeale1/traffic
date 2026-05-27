@@ -1,13 +1,17 @@
-# Site-specific configuration data
-REMOTE_HOST       = "user@host.local"      # host on LAN to save data on
-REMOTE_DIR        = "/mnt/motion_folder/"  # folder on remote host to save files on
-LOG_DIR           = "/home/pi/CAM2"
+# Site-specific configuration - do not commit
+REMOTE_HOST       = "jbeale@jbeale-mini"
+REMOTE_DIR        = "/mnt/bluecherry/CAMA/"
+LOG_DIR           = "/home/pi/CAMA"
 VENV_PYTHON       = "/home/pi/cam-env/bin/python"
-TUNING_FILE       = "/home/pi/CAM2/imx477_custom.json"
+TUNING_FILE       = "/home/pi/CAMA/imx477_custom.json"
+ROTATION          = True
+FORCE_REMOTE_SAVE = True
 
 # Camera ROI (main frame coordinates)
 ROI_X1, ROI_Y1 = 0, 0
-ROI_X2, ROI_Y2 = 4055, 3039
+ROI_X2, ROI_Y2 = 1455, 1087 # for Pi GlobalShutter camera (IMX296)
+# ROI_X2, ROI_Y2 = 4055, 3039  # for Pi HQ camera (IMX477)
+
 
 # Motion thresholds (tune to your scene)
 THRESHOLD_DAY     = 1600
@@ -22,3 +26,7 @@ LATENCY_STEADY_MS = 441
 
 # minimum seconds between full-res saves during an event (actual min: 0.342 s)
 MIN_SAVE_INTERVAL_S    = 0.6
+
+DETECT_OUT_DIR = "/home/pi/CAMA/results"
+
+
