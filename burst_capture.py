@@ -6,13 +6,15 @@ using IMX296 (Global Shutter) or IMX477 (HQ Camera)
 Background mode: monitors NUM_ZONES horizontal zones of the lores YUV stream at 10 fps
 using per-zone EMA background models.  When a vehicle enters the frame its centroid is
 tracked across zones; as soon as the centroid crosses the horizontal midpoint the two
-flanking frames (100 ms apart) are saved — giving a well-centred pair without manual
-selection.  Zone models are frozen during an event and reanchored afterward.  An 8-second
+flanking frames (50 or 100 ms apart) are saved — giving a well-centred pair without manual
+selection.  For oversized vehicles that fill ≥ NUM_ZONES-1 zones simultaneously, two pairs
+are saved instead: one when the vehicle first fills the frame, and one when it starts to
+leave.  Zone models are frozen during an event and reanchored afterward.  An 8-second
 timeout abandons stalled events and reinitialises all zone models.
 
 Each event produces three files named:
-  YYYYMMDD_HHMMSS_sss_NNN.jpg  — ISP-processed JPEG (4056x1600 after crop), deleted after transfer
-                                 (lower res with other sensors)
+  YYYYMMDD_HHMMSS_sss_NNN.jpg  — ISP-processed JPEG (HQ cam: 4056x1600 after crop), deleted after transfer
+                                 (note: lower res with IMX296 sensor)
 
 Usage:
   python3 burst_capture.py [--shutter US] [--gain G] [--tune FILE]
@@ -26,9 +28,12 @@ Options:
   --bursts N      Stop after N events (default: 0 = run forever)
   --fmt           Output image format: jpeg or tiff (default: jpeg)
   --shm-min-mb M  Minimum free /dev/shm space in MB before pausing capture (default: 50)
+
+  note: camera is assumed upside-down. Image is rotated 180 before saving.
 """
 
 import argparse
+import collections
 import math
 import logging
 import os
@@ -48,7 +53,7 @@ from libcamera import controls as libctrls
 
 from config import REMOTE_HOST, REMOTE_DIR
 
-VERSION = "1.56"  # use Pi global shutter camera
+VERSION = "1.994"  # split max_z into zm/zv in log; add zv_zones to reason string
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -60,10 +65,14 @@ LORES_SIZE   = (400, 300)      # lores stream size requested; actual buffer may 
 RAW_SIZE     = (1456, 1088)    # full frame size of Pi global shutter camera (IMX296)
 CROP_OFFSET  = int(-130 * (1088/2160))            # vertical offset +moves image down in final (rotated) image
 CROP_H       = int(1600 * (1088/2160))           # final image height after software crop of 2160-row raw frame
-NUM_ZONES    = 12               # number of horizontal detection zones across lores frame
+NUM_ZONES    = 20               # number of horizontal detection zones across lores frame
 ZONE_W       = int(LORES_SIZE[0] / (NUM_ZONES - 1))  # width in pixels of each zone
 EVENT_TIMEOUT_S = 8.0          # abandon event and rewarm if vehicle doesn't clear in this time
-EVENT_MIN_TRAVEL = 50          # min centroid travel (lores px) to save even without midpoint crossing
+EVENT_MIN_TRAVEL = 75          # min centroid travel (lores px) to save even without midpoint crossing
+
+ZV_HIT_THRESHOLD   = 10.0               # per-zone zv score to count a zone as vehicle-occupied (sizing/centroid)
+ZV_OVERSIZED_ZONES = int(NUM_ZONES * 0.92)  # zv-hot zone count that classifies a vehicle as oversized
+
 SHM_DIR      = Path("/dev/shm/burst")
 BG_ALPHA     = 0.02            # EMA coefficient for background model (slow adapt)
 BG_WARMUP    = 60              # frames before motion detection is armed
@@ -85,12 +94,8 @@ BG_ROOF_MAX_FILL  = 30   # max rows the roofline smoother may fill downward per 
 BG_TOP_MEDIAN_W   = 51   # column window for median-filtering the top-edge profile (must be odd)
 BG_TOP_SPIKE_TOL  = 3    # rows: top-edge pixels this far above the median profile are suppressed
 
-BG_SHADOW_BOTTOM_FRAC = 0.10   # fraction of mask height to treat as the shadow zone
 BG_SHADOW_DARK_MARGIN = 8      # shadow pixel must be darker than bg by at least this DN
 BG_GROUND_MARGIN_PX = 8   # rows below the vehicle floor to tolerate (wheels dip here)
-
-FRINGE_EDGE_THRESHOLD = 20     # minimum G-channel gradient magnitude (DN) to include a pixel
-                               # in the demosaic fringe score; lower = more sensitive to noise
 
 
 logging.basicConfig(
@@ -104,16 +109,20 @@ log = logging.getLogger("burst")
 # Daily event counter persistence
 # ---------------------------------------------------------------------------
 
-def _load_event_num() -> int:
-    """Read today's last event number from the state file; return 0 if absent or stale."""
+def _load_event_num() -> tuple[int, str]:
+    """Read the last event number and its date from the state file.
+
+    Returns (event_num, date_str) where date_str is 'YYYYMMDD' of the last saved
+    event, or (0, '') if the file is absent or unreadable.  The caller is
+    responsible for deciding whether to reset the counter based on the date.
+    """
     try:
         text = EVENT_NUM_FILE.read_text().strip().split()
         date_str, num_str = text[0], text[1]
-        if date_str == datetime.now().strftime("%Y%m%d"):
-            return int(num_str)
+        return int(num_str), date_str
     except Exception:
         pass
-    return 0
+    return 0, ""
 
 def _save_event_num(event_num: int):
     """Write today's date and current event number to the state file."""
@@ -204,18 +213,18 @@ class StripeBackground:
 
     def update(self, col_means: np.ndarray, col_cvs: np.ndarray):
         if self.mean_m is None:
-            self.mean_m = col_means.astype(np.float32)
-            self.mad_m  = np.ones_like(self.mean_m) * 8.0
-            self.mean_v = col_cvs.astype(np.float32)
-            self.mad_v  = np.ones_like(self.mean_v) * 0.02
+            self.mean_m   = col_means.astype(np.float32)
+            self.mad_m    = np.ones_like(self.mean_m) * 8.0
+            self.mean_v   = col_cvs.astype(np.float32)
+            self.mad_v    = np.ones_like(self.mean_v) * 0.02
         else:
             a = 0.5 if self._reanchor_frames > 0 else self.alpha
             if self._reanchor_frames > 0:
                 self._reanchor_frames -= 1
-            self.mad_m  = a * np.abs(col_means - self.mean_m) + (1 - a) * self.mad_m
-            self.mean_m = a * col_means + (1 - a) * self.mean_m
-            self.mad_v  = a * np.abs(col_cvs - self.mean_v)   + (1 - a) * self.mad_v
-            self.mean_v = a * col_cvs  + (1 - a) * self.mean_v
+            self.mad_m    = a * np.abs(col_means - self.mean_m) + (1 - a) * self.mad_m
+            self.mean_m   = a * col_means + (1 - a) * self.mean_m
+            self.mad_v    = a * np.abs(col_cvs - self.mean_v)   + (1 - a) * self.mad_v
+            self.mean_v   = a * col_cvs  + (1 - a) * self.mean_v
         self.n += 1
 
     def z_scores(self, col_means: np.ndarray, col_cvs: np.ndarray):
@@ -278,102 +287,128 @@ class ZoneTracker:
         return all(bg.ready for bg in self.bgs)
 
     def _zone_stats(self, y_plane: np.ndarray, x_start: int):
-        """Return (col_means, col_cvs) for one zone stripe (road band only)."""
-        stripe = y_plane[100:200, x_start : x_start + self.zone_w]
+        """Return (col_means, col_cvs) for one zone stripe (upper body band only).
+
+        Stripe covers lores rows 40-130 (upper ~27-43% of frame height), targeting
+        vehicle roof/upper body panels.  Keeping the stripe well above the road
+        avoids contamination from low-sun road shadows.
+        """
+        stripe = y_plane[40:130, x_start : x_start + self.zone_w]
         m = stripe.mean(axis=0)
         s = stripe.std(axis=0)
         cv = s / np.maximum(m, 1.0)
         return m, cv
 
-    def feed(self, y_plane: np.ndarray, freeze: bool = False,
-             anchor_zone: int | None = None
-             ) -> tuple[float | None, list[int], str]:
+    def feed(self, y_plane, freeze=False, anchor_zone=None, hit_threshold=3,
+             exposure_ratio: float = 1.0) -> tuple[float | None, list[int], str, np.ndarray, np.ndarray, float, list[int]]:
         """Process one lores frame.
 
         Args:
-            y_plane:     lores Y plane.
-            freeze:      if True, skip background model updates (called during an event).
-            anchor_zone: index of the zone that started the current event, or None
-                         during monitoring.  When supplied, any occupied zone that is
-                         separated from the contiguous block containing anchor_zone by
-                         more than one quiet zone is treated as noise (e.g. a moving
-                         tree shadow) and excluded from the occupied list and centroid.
+            y_plane:        lores Y plane.
+            freeze:         if True, skip background model updates (called during an event).
+            anchor_zone:    index of the zone that started the current event, or None
+                            during monitoring.
+            exposure_ratio: (current_exp * current_ag) / (anchor_exp * anchor_ag).
+                            Supplied by the caller from frame metadata; used to correct
+                            the frozen background model for AGC shifts during an event.
+                            1.0 when not in a frozen event.
 
         Returns:
-            (centroid, occupied_zones, reason)
+            (centroid, occupied_zones, reason, zone_zm, zone_zv, gain_used, zv_occupied)
+            zone_zm / zone_zv are float32 arrays of length num_zones containing the
+            per-zone peak z-score for the mean and CV signals respectively.
+            Zones that are not yet warmed up carry NaN.
+            gain_used is the multiplicative exposure-gain correction applied this frame.
+            occupied_zones uses zm+zv AND gate — used for event triggering only.
+            zv_occupied uses ZV_HIT_THRESHOLD on zv alone — used for centroid and
+            oversized detection.
         """
         occupied = []
-        max_z = 0.0
+        max_zm = 0.0
+        max_zv = 0.0
+        zone_zm = np.full(self.num_zones, np.nan, dtype=np.float32)
+        zone_zv = np.full(self.num_zones, np.nan, dtype=np.float32)
 
+        # Collect per-zone stats for all ready zones in one pass.
+        zone_stats = []   # list of (i, x0, bg, col_means, col_cvs) for ready zones
         for i, (x0, bg) in enumerate(zip(self.zone_starts, self.bgs)):
             m, cv = self._zone_stats(y_plane, x0)
-
             if not bg.ready:
                 bg.update(m, cv)
+                zone_stats.append(None)
                 continue
+            zone_stats.append((i, x0, bg, m, cv))
 
-            zm, zv = bg.z_scores(m, cv)
-            hit = int(((zm > self.threshold) & (zv > self.threshold)).sum())
-            max_z = max(max_z, zm.max(), zv.max())
+        # During a frozen event, scale the frozen background model by the ratio of
+        # current exposure to the exposure at event start.  This corrects for AGC
+        # shifts without relying on unoccupied reference zones (which may be
+        # contaminated by the vehicle halo or absent when the vehicle fills the frame).
+        gain = exposure_ratio if freeze else 1.0
+        if not freeze:
+            self._last_gain = 1.0   # reset between events
 
-            if hit >= 3:
+        for entry in zone_stats:
+            if entry is None:
+                continue
+            i, x0, bg, m, cv = entry
+            if gain != 1.0:
+                corrected_mean_m = bg.mean_m * gain
+                std_m = np.maximum(bg.mad_m * 1.4826, 1.0)
+                std_v = np.maximum(bg.mad_v * 1.4826, 0.005)
+                zm = np.abs(m - corrected_mean_m) / std_m
+                zv = np.abs(cv - bg.mean_v) / std_v
+            else:
+                zm, zv = bg.z_scores(m, cv)
+            # Monitoring: require BOTH zm and zv to be anomalous (AND) to avoid
+            # false triggers from shadows (which shift mean but not texture) or
+            # global exposure steps (which shift mean uniformly across all zones).
+            # During a confirmed event: use zv alone to sustain tracking.
+            # zv (CV z-score) is insensitive to global brightness shifts — a uniform
+            # exposure change scales both std and mean together, leaving CV unchanged —
+            # so it reliably tracks the vehicle's physical location without being
+            # fooled by AGC steps.  zm is still used for initial triggering where the
+            # AND gate prevents shadow/exposure false starts.
+            if freeze:
+                hit = int((zv > self.threshold).sum())
+            else:
+                hit = int(((zm > self.threshold) & (zv > self.threshold)).sum())
+            max_zm = max(max_zm, zm.max())
+            max_zv = max(max_zv, zv.max())
+
+            zone_zm[i] = float(zm.max())
+            zone_zv[i] = float(zv.max())
+
+            if hit >= hit_threshold:
                 occupied.append(i)
             elif not freeze:
                 bg.update(m, cv)
 
         if not self.ready:
-            return None, [], "warming up"
+            return None, [], "warming up", zone_zm, zone_zv, gain, []
 
         if not occupied:
-            return None, [], f"clear  max_z={max_z:.1f}"
+            return None, [], f"clear  zm={max_zm:.1f}  zv={max_zv:.1f}", zone_zm, zone_zv, gain, []
 
-        # Spatial continuity filter: when an anchor zone is known, keep only
-        # the contiguous block of occupied zones that includes the anchor.
-        # Zones separated from that block by more than one quiet zone are
-        # discarded as noise (moving shadows, etc.).
-        if anchor_zone is not None and anchor_zone in occupied:
-            occupied_set = set(occupied)
-            # Grow outward from anchor_zone, allowing at most one quiet-zone gap.
-            kept = {anchor_zone}
-            for direction in (-1, +1):
-                cursor = anchor_zone
-                while True:
-                    cursor += direction
-                    if cursor < 0 or cursor >= self.num_zones:
-                        break
-                    if cursor in occupied_set:
-                        kept.add(cursor)
-                    else:
-                        # one-zone gap: look one further before giving up
-                        cursor += direction
-                        if cursor < 0 or cursor >= self.num_zones:
-                            break
-                        if cursor in occupied_set:
-                            kept.add(cursor)
-                        else:
-                            break   # two consecutive quiet zones — stop expanding
-            noise = [z for z in occupied if z not in kept]
-            occupied = sorted(kept)
-            if noise:
-                max_z_tag = f"  max_z={max_z:.1f}"
-                noise_tag = f"  noise_zones={noise}"
-            else:
-                max_z_tag = f"  max_z={max_z:.1f}"
-                noise_tag = ""
+        max_z_tag = f"  zm={max_zm:.1f}  zv={max_zv:.1f}"
+
+        # zv-hot zones: used for centroid and oversized detection.
+        # zm+zv AND gate (occupied) is kept for initial trigger only.
+        zv_occupied = [i for i in range(self.num_zones)
+                       if not np.isnan(zone_zv[i]) and zone_zv[i] >= ZV_HIT_THRESHOLD]
+
+        if zv_occupied:
+            # Centroid from zv-hot zones only — tracks physical vehicle position
+            # without being contaminated by road shadows or AGC-driven zm artefacts.
+            centroid = float(np.median([self.zone_centers[i] for i in zv_occupied]))
         else:
-            max_z_tag = f"  max_z={max_z:.1f}"
-            noise_tag = ""
+            # Fallback to trigger-occupied zones if zv is below threshold
+            # (shouldn't normally happen during a confirmed event).
+            centroid = float(np.median([self.zone_centers[i] for i in occupied]))
 
-        if not occupied:
-            return None, [], f"clear (filtered){max_z_tag}"
-
-        # Centroid = mean of all occupied zone centres (robust to a single
-        # edge zone firing late, which would skew a leftmost/rightmost midpoint)
-        centroid = float(np.mean([self.zone_centers[i] for i in occupied]))
-        offset   = centroid - self.frame_center
-        reason   = (f"zones={occupied}  centroid={centroid:.0f}"
-                    f"  offset={offset:+.0f}{max_z_tag}{noise_tag}")
-        return centroid, occupied, reason
+        offset = centroid - self.frame_center
+        reason = (f"zones={occupied}  zv_zones={len(zv_occupied)}  centroid={centroid:.0f}"
+                  f"  offset={offset:+.0f}{max_z_tag}")
+        return centroid, occupied, reason, zone_zm, zone_zv, gain, zv_occupied
 
 
 # ---------------------------------------------------------------------------
@@ -386,39 +421,6 @@ def load_frame(npy_path: Path) -> np.ndarray:
     actually RGB-ordered in memory — see https://forums.raspberrypi.com/viewtopic.php?t=397177"""
     return np.load(str(npy_path))
 
-
-def compute_fringe_score(rgb: np.ndarray,
-                         edge_threshold: int = FRINGE_EDGE_THRESHOLD) -> float:
-    """Return a demosaic fringe score for a full-resolution RGB frame.
-
-    At each pixel, a debayer zipper artifact manifests as R or B channels
-    transitioning across an edge one pixel earlier or later than G.  This
-    is measured as the horizontal gradient disagreement between channels:
-
-        fringe = |dR/dx - dG/dx| + |dB/dx - dG/dx|
-
-    evaluated only at pixels where the G-channel gradient magnitude exceeds
-    edge_threshold (to exclude flat/noise regions from the average).
-
-    Returns the mean fringe value over all qualifying edge pixels, or 0.0
-    if no edge pixels exceed the threshold.
-    """
-    r = rgb[:, :, 0].astype(np.int16)
-    g = rgb[:, :, 1].astype(np.int16)
-    b = rgb[:, :, 2].astype(np.int16)
-
-    # Horizontal gradients via simple 1-pixel finite difference (fast, Bayer-cell aligned)
-    dr = np.abs(r[:, 1:] - r[:, :-1])
-    dg = np.abs(g[:, 1:] - g[:, :-1])
-    db = np.abs(b[:, 1:] - b[:, :-1])
-
-    edge_mask = dg > edge_threshold
-    n_edge = int(edge_mask.sum())
-    if n_edge == 0:
-        return 0.0
-
-    fringe = (np.abs(dr - dg) + np.abs(db - dg)).astype(np.float32)
-    return float(fringe[edge_mask].mean())
 
 def rsync_file(local_path: Path) -> bool:
     global _rsync_proc
@@ -495,6 +497,8 @@ def _build_exif(meta: dict):
 
 # Each item on the queue is a list of (npy_path, meta_dict) tuples for one burst.
 _work_queue: queue.Queue = queue.Queue()
+# CSV debug files queued for rsync transfer: each item is a Path.
+_csv_queue: queue.Queue = queue.Queue()
 _stop_event = threading.Event()
 _rsync_proc: subprocess.Popen | None = None
 _rsync_lock = threading.Lock()
@@ -510,10 +514,50 @@ def _load_and_crop(npy_path: Path) -> np.ndarray:
     return rgb[margin : margin + CROP_H, :]
 
 
+def _corner_histogram_match(bg_rgb: np.ndarray, car_rgb: np.ndarray,
+                            corner_frac: float = 0.10) -> np.ndarray:
+    """Return a copy of bg_rgb exposure-matched to car_rgb using only the four corners.
+
+    For each channel independently, builds a cumulative histogram from the four
+    corner patches (top-left, top-right, bottom-left, bottom-right) of both images,
+    then derives a 256-entry LUT that maps bg pixel values to the corresponding
+    quantile in the car image.  Applying this LUT to the full bg_rgb cancels global
+    exposure / gamma shifts before the diff is computed, without being contaminated
+    by vehicle pixels (which are concentrated in the centre of the frame).
+    """
+    h, w = bg_rgb.shape[:2]
+    ph, pw = max(1, int(h * corner_frac)), max(1, int(w * corner_frac))
+
+    def _corner_pixels(img: np.ndarray) -> np.ndarray:
+        patches = [
+            img[:ph,   :pw,   :],   # top-left
+            img[:ph,   w-pw:, :],   # top-right
+            img[h-ph:, :pw,   :],   # bottom-left
+            img[h-ph:, w-pw:, :],   # bottom-right
+        ]
+        return np.concatenate([p.reshape(-1, 3) for p in patches], axis=0)
+
+    bg_px  = _corner_pixels(bg_rgb)
+    car_px = _corner_pixels(car_rgb)
+
+    bg_matched = bg_rgb.copy().astype(np.uint8)
+    for c in range(3):
+        bg_hist,  _ = np.histogram(bg_px[:,  c], bins=256, range=(0, 256))
+        car_hist, _ = np.histogram(car_px[:, c], bins=256, range=(0, 256))
+        bg_cdf  = bg_hist.cumsum().astype(np.float32);  bg_cdf  /= bg_cdf[-1]  + 1e-6
+        car_cdf = car_hist.cumsum().astype(np.float32); car_cdf /= car_cdf[-1] + 1e-6
+        lut = np.searchsorted(car_cdf, bg_cdf).astype(np.uint8)
+        bg_matched[:, :, c] = lut[bg_rgb[:, :, c]]
+
+    return bg_matched
+
+
 def _build_fg_mask(bg_rgb: np.ndarray, car_rgb: np.ndarray) -> np.ndarray:
     """Return a uint8 mask (255=foreground, 0=background) for car_rgb given bg_rgb.
 
     Pipeline:
+      0. Corner histogram match — bg_rgb is exposure-corrected to car_rgb using
+         the four 10%-corner patches before any diff is computed.
       1. Per-channel absolute difference, max across channels.
       2. Threshold → binary mask.
       3. Morphological open  — removes small isolated noise specks.
@@ -530,6 +574,8 @@ def _build_fg_mask(bg_rgb: np.ndarray, car_rgb: np.ndarray) -> np.ndarray:
       8. Flood-fill from border — fills any remaining fully-enclosed interior holes
          without convexifying the outline.
     """
+    bg_rgb = _corner_histogram_match(bg_rgb, car_rgb)
+
     # diff = np.abs(car_rgb.astype(np.int16) - bg_rgb.astype(np.int16))
     # mask = (diff.max(axis=2) > BG_DIFF_THRESHOLD).astype(np.uint8) * 255
     gray     = cv2.cvtColor(car_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
@@ -561,38 +607,6 @@ def _build_fg_mask(bg_rgb: np.ndarray, car_rgb: np.ndarray) -> np.ndarray:
 
     # Second close on the clean single-component mask
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close2)
-
-    # Ground-line clamp: suppress shadow/wake pixels below the vehicle floor.
-    # Find the lowest row that has foreground within the core horizontal body span,
-    # then remove any foreground pixels that are (a) below that row AND (b) outside
-    # the central horizontal extent of the full mask, OR darker than the bg.
-    # This removes trailing/leading ground shadows that survive the morphological steps.
-    h, w = mask.shape
-    fg_ys2, fg_xs2 = np.where(mask > 127)
-    if len(fg_ys2) > 0:
-        x_min2, x_max2 = int(fg_xs2.min()), int(fg_xs2.max())
-        core_x_lo = x_min2 + (x_max2 - x_min2) // 6
-        core_x_hi = x_max2 - (x_max2 - x_min2) // 6
-        # Ground row = lowest fg row within the core horizontal span
-        core_cols = (fg_xs2 >= core_x_lo) & (fg_xs2 <= core_x_hi)
-        if core_cols.any():
-            ground_row = int(fg_ys2[core_cols].max())
-            floor_limit = ground_row + BG_GROUND_MARGIN_PX
-            # Suppress fg pixels below the floor that are also outside the full body x-span
-            # or darker than bg (i.e. shadow / wake, not a tyre)
-            for r in range(floor_limit, h):
-                fg_in_row = np.where(mask[r, :] > 127)[0]
-                if len(fg_in_row) == 0:
-                    continue
-                car_lum = car_rgb[r, fg_in_row].mean(axis=1).astype(np.float32)
-                bg_lum  =  bg_rgb[r, fg_in_row].mean(axis=1).astype(np.float32)
-                # Remove if darker than bg (shadow) regardless of x position
-                shadow = car_lum < bg_lum - BG_SHADOW_DARK_MARGIN
-                mask[r, fg_in_row[shadow]] = 0
-                # Also remove anything laterally outside the full body span even if not darker
-                outside_body = (fg_in_row < x_min2) | (fg_in_row > x_max2)
-                mask[r, fg_in_row[outside_body]] = 0
-
 
     # Roofline smoothing: fit a polynomial to the topmost white pixel per column
     # within the mask's horizontal extent and upper BG_ROOF_TOP_FRAC of the frame,
@@ -679,38 +693,140 @@ def _build_fg_mask(bg_rgb: np.ndarray, car_rgb: np.ndarray) -> np.ndarray:
     cv2.floodFill(bordered, None, (0, 0), 0)
     holes = bordered[1:h + 1, 1:w + 1]
 
-    # Shadow removal: any foreground pixels in the bottom BG_SHADOW_BOTTOM_FRAC of the
-    # mask's vertical extent that extend beyond the horizontal bounds of the upper body
-    # are removed, provided they are also darker than the background.
-    fg_rows = np.where(mask.max(axis=1) > 127)[0]
-    if len(fg_rows) > 0:
-        mask_top    = int(fg_rows.min())
-        mask_bottom = int(fg_rows.max())
-        mask_h      = mask_bottom - mask_top + 1
+    final = cv2.bitwise_or(mask, holes)
 
-        split_row = mask_bottom - int(mask_h * BG_SHADOW_BOTTOM_FRAC)
+    # Ground-line clamp + shadow removal — runs AFTER hole-fill so it cannot be
+    # undone by the flood-fill step.
+    #
+    # Strategy:
+    #   1. Find the vehicle floor row: the lowest fg row within the central 2/3 of
+    #      the horizontal body span (avoids shadow pixels at the edges inflating it).
+    #   2. Compute body x-span (5th/95th percentile of per-row extents above the
+    #      floor, to exclude low-hanging wheel arches inflating the span).
+    #   3. For every row below floor+margin, remove fg pixels that are:
+    #      a. darker than bg (shadow regardless of x), OR
+    #      b. outside the body x-span (trailing/leading wake).
+    #   4. Bottom-edge profile clamp: fit a median-smoothed curve to the lowest fg
+    #      row per column (within the body x-span), then zero any fg pixels that
+    #      fall more than BG_GROUND_MARGIN_PX below that curve.  This catches shadow
+    #      halos on dark vehicles where the shadow is the same luminance as the bg
+    #      and the darkness test cannot fire.
+    h, w = final.shape
+    fg_ys, fg_xs = np.where(final > 127)
+    if len(fg_ys) > 0:
+        x_min, x_max = int(fg_xs.min()), int(fg_xs.max())
+        core_x_lo = x_min + (x_max - x_min) // 6
+        core_x_hi = x_max - (x_max - x_min) // 6
+        core_mask = (fg_xs >= core_x_lo) & (fg_xs <= core_x_hi)
+        if core_mask.any():
+            # Use 85th percentile rather than max() so that shadow pixels
+            # below the vehicle floor (which merge into the fg mask on dark
+            # cars) don't drag ground_row — and therefore floor_limit — down
+            # into the shadow region, defeating the clamp that follows.
+            ground_row  = int(np.percentile(fg_ys[core_mask], 85))
+            floor_limit = ground_row + BG_GROUND_MARGIN_PX
 
-        # Horizontal extent of the upper body portion
-        upper_cols = np.where(mask[mask_top : split_row, :].max(axis=0) > 127)[0]
-        if len(upper_cols) >= 2:
-            body_x_min = int(upper_cols.min())
-            body_x_max = int(upper_cols.max())
+            # Body x-span: 5th/95th percentile of per-row extents above the floor
+            above = fg_ys < floor_limit
+            if above.any():
+                above_ys = fg_ys[above]
+                above_xs = fg_xs[above]
+                unique_rows = np.unique(above_ys)
+                row_x_lo = np.array([above_xs[above_ys == r].min() for r in unique_rows])
+                row_x_hi = np.array([above_xs[above_ys == r].max() for r in unique_rows])
+                body_x_min = int(np.percentile(row_x_lo, 5))
+                body_x_max = int(np.percentile(row_x_hi, 95))
+            else:
+                body_x_min, body_x_max = x_min, x_max
 
-            # In the bottom strip, zero pixels outside the body extent that are darker than bg
-            for r in range(split_row, mask_bottom + 1):
-                outside = np.where(
-                    (mask[r, :] > 127) &
-                    (np.arange(w) < body_x_min) | 
-                    ((mask[r, :] > 127) & (np.arange(w) > body_x_max))
-                )[0]
-                if len(outside) == 0:
+            # Pass 1: luminance + lateral tests
+            for r in range(floor_limit, h):
+                fg_in_row = np.where(final[r, :] > 127)[0]
+                if len(fg_in_row) == 0:
                     continue
-                car_lum = car_rgb[r, outside].mean(axis=1).astype(np.float32)
-                bg_lum  =  bg_rgb[r, outside].mean(axis=1).astype(np.float32)
-                dark    = car_lum < bg_lum - BG_SHADOW_DARK_MARGIN
-                mask[r, outside[dark]] = 0
+                car_lum = car_rgb[r, fg_in_row].mean(axis=1).astype(np.float32)
+                bg_lum  =  bg_rgb[r, fg_in_row].mean(axis=1).astype(np.float32)
+                shadow       = car_lum < bg_lum - BG_SHADOW_DARK_MARGIN
+                outside_body = (fg_in_row < body_x_min) | (fg_in_row > body_x_max)
+                final[r, fg_in_row[shadow | outside_body]] = 0
 
-    return cv2.bitwise_or(mask, holes)
+            # Pass 2: bottom-edge profile clamp — catches dark-car shadows that
+            # match bg luminance and survive pass 1, AND lateral streaks that extend
+            # beyond body_x_max (which pass 1 misses when body_x_max is inflated by
+            # a low wheel arch).
+            #
+            # Scan the full fg x-range (x_min..x_max).  For each column, find the
+            # lowest fg row and build a bottom-edge profile.  Median-smooth only the
+            # columns within body_x_min..body_x_max (the vehicle undercarriage); for
+            # columns outside that span the smoothed value is clamped to floor_limit
+            # so everything below the vehicle floor is zeroed there.
+            col_range = np.arange(x_min, x_max + 1)
+            bot_edge = np.full(len(col_range), np.nan)
+            for i, col in enumerate(col_range):
+                # Use only pixels above floor_limit so shadow pixels below the
+                # vehicle floor don't drag the bottom-edge profile downward.
+                hits = np.where(final[:floor_limit, col] > 127)[0]
+                if len(hits):
+                    bot_edge[i] = hits.max()
+            # Build the smoothed profile over the body span, clamp outside it
+            valid_bot = ~np.isnan(bot_edge)
+            if valid_bot.sum() > 0:
+                # Forward/backward fill NaNs before smoothing
+                filled = bot_edge.copy()
+                last = np.nan
+                for i in range(len(filled)):
+                    if not np.isnan(filled[i]): last = filled[i]
+                    elif not np.isnan(last):     filled[i] = last
+                last = np.nan
+                for i in range(len(filled) - 1, -1, -1):
+                    if not np.isnan(filled[i]): last = filled[i]
+                    elif not np.isnan(last):     filled[i] = last
+                half = BG_TOP_MEDIAN_W // 2
+                padded = np.pad(filled, half, mode='edge')
+                smoothed_bot = np.array([np.median(padded[i:i + BG_TOP_MEDIAN_W])
+                                         for i in range(len(filled))])
+                for i, col in enumerate(col_range):
+                    if np.isnan(bot_edge[i]):
+                        continue
+                    # Outside the body x-span: zero everything at or below floor_limit
+                    if col < body_x_min or col > body_x_max:
+                        final[floor_limit:, col] = 0
+                    else:
+                        floor_row = int(smoothed_bot[i]) + BG_GROUND_MARGIN_PX
+                        if floor_row < h - 1:
+                            final[floor_row + 1:, col] = 0
+
+    # Bottom-10% lateral clamp: prevent shadow "beaks" that extend beyond the
+    # vehicle body at the very bottom of the mask.  For the lowest 10% of the
+    # fg bounding box height, clip each row's white pixels to the left/right
+    # extent of the fg pixels in the rows above that band.  Purely subtractive.
+    fg_ys_c, fg_xs_c = np.where(final > 127)
+    if len(fg_ys_c) > 0:
+        fg_top_c  = int(fg_ys_c.min())
+        fg_bot_c  = int(fg_ys_c.max())
+        fg_h_c    = fg_bot_c - fg_top_c
+        if fg_h_c > 0:
+            beak_row = fg_bot_c - max(1, int(fg_h_c * 0.10))
+            above_mask_c = fg_ys_c < beak_row
+            if above_mask_c.any():
+                upper_x_min = int(fg_xs_c[above_mask_c].min())
+                upper_x_max = int(fg_xs_c[above_mask_c].max())
+                for r in range(beak_row, fg_bot_c + 1):
+                    row_fg = np.where(final[r, :] > 127)[0]
+                    if len(row_fg) == 0:
+                        continue
+                    outside = (row_fg < upper_x_min) | (row_fg > upper_x_max)
+                    if outside.any():
+                        final[r, row_fg[outside]] = 0
+
+    # Final connected-component filter: discard thin streaks or isolated blobs
+    # that survive all prior cleanup.
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(final, connectivity=8)
+    if n_labels > 1:
+        largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        final = np.where(labels == largest, np.uint8(255), np.uint8(0))
+
+    return final
 
 
 def _worker(fmt: str):
@@ -739,6 +855,7 @@ def _worker(fmt: str):
 
         frames = item   # list of (npy_path, meta, event_num)
         converted: list[Path] = []
+        back_path_saved: Path | None = None   # guard against duplicate _back.jpg per job
 
         # Load and crop the background frame first (index 0); keep it in memory
         # so it can be reused for each vehicle frame subtraction.
@@ -799,6 +916,29 @@ def _worker(fmt: str):
                     PilImage.fromarray(mask, mode="L").save(str(mask_path), format="PNG")
                     log.info("[worker] saved mask %s", mask_path.name)
                     converted.append((None, mask_path))  # None: no npy to clean up
+
+                    # Debug: save background reference image when mask is suspiciously large.
+                    # Condition: mask has white pixels in both left and right corner columns
+                    # AND more than 50% of all pixels are white.
+                    # Only saved once per job: all vehicle frames share the same background
+                    # and produce the same filename (frames[0][0].stem), so saving it for
+                    # each frame would append duplicate entries to `converted` and cause
+                    # rsync to fail on the second attempt after the first transfer succeeds.
+                    if bg_rgb is not None and back_path_saved is None:
+                        mask_w = mask.shape[1]
+                        corner_w  = max(2, mask_w // 20)   # ~5% of frame width
+                        left_hit  = mask[:, :corner_w].any()
+                        right_hit = mask[:, mask_w - corner_w:].any()
+                        white_frac = (mask > 0).mean()
+                        if left_hit and right_hit and white_frac > 0.5:
+                            bg_stem = f"{frames[0][0].stem}_{event_num}_back"
+                            back_path = npy_path.with_name(f"{bg_stem}.jpg")
+                            PilImage.fromarray(bg_rgb).save(
+                                str(back_path), format="JPEG", quality=92)
+                            log.info("[worker] debug bg saved %s  (white=%.1f%%)",
+                                     back_path.name, white_frac * 100)
+                            converted.append((None, back_path))
+                            back_path_saved = back_path
             except Exception as e:
                 log.error("[worker] conversion failed for %s: %s", npy_path.name, e)
 
@@ -838,7 +978,179 @@ def _worker(fmt: str):
                             npy_label, out_path.name)
                 _failed_transfers.append((npy_path, out_path))
 
+        # Transfer any pending CSV debug files.
+        while True:
+            try:
+                csv_path = _csv_queue.get_nowait()
+            except queue.Empty:
+                break
+            if csv_path.exists():
+                ok = rsync_file(csv_path)
+                if ok:
+                    log.info("[worker] transferred csv %s", csv_path.name)
+                else:
+                    log.warning("[worker] csv transfer failed, keeping %s", csv_path.name)
+                    _failed_transfers.append((None, csv_path))
+
         _work_queue.task_done()
+
+
+# ---------------------------------------------------------------------------
+# Zone debug logger — captures per-zone zm/zv for every frame in a window
+# around each vehicle event and writes a CSV to SHM_DIR for transfer.
+#
+# Layout:
+#   phase       — "pre", "event", "post", "cooldown"
+#   frame_num   — global frame counter from main loop
+#   timestamp   — HH:MM:SS.mmm wall-clock string
+#   centroid    — lores-pixel centroid (NaN when no vehicle detected)
+#   occupied    — comma-separated list of occupied zone indices (empty string when none)
+#   zm_00…zm_19 — per-zone peak mean z-score  (NaN = zone not warmed up)
+#   zv_00…zv_19 — per-zone peak CV z-score    (NaN = zone not warmed up)
+# ---------------------------------------------------------------------------
+
+_DEBUG_PRE_FRAMES  = 5    # rolling pre-event frames to prepend
+_DEBUG_POST_FRAMES = 20   # tail frames to append after event ends
+
+class ZoneDebugLogger:
+    """Accumulates zone zm/zv data around one vehicle event and writes a CSV."""
+
+    def __init__(self, num_zones: int = NUM_ZONES):
+        self._num_zones  = num_zones
+        self._pre_buf    : collections.deque = collections.deque(maxlen=_DEBUG_PRE_FRAMES)
+        self._rows       : list = []          # rows for the current active event
+        self._active     : bool = False
+        self._tail_left  : int  = 0           # post-event frames still to collect
+        self._first_stem : str  = ""          # timestamp stem of the first pre-event frame
+
+    # ------------------------------------------------------------------
+    # Call every frame regardless of event state
+    # ------------------------------------------------------------------
+    def record(self, stem: str, frame_num: int, dt: datetime,
+               centroid, occupied: list,
+               zone_zm: np.ndarray, zone_zv: np.ndarray,
+               phase: str, meta: dict | None = None,
+               gain_used: float = 1.0):
+        """Add one frame's data."""
+        m = meta or {}
+        exp_us  = m.get("ExposureTime")
+        ag      = m.get("AnalogueGain")
+        dg      = m.get("DigitalGain")
+        lux     = m.get("Lux")
+        row = {
+            "phase":        phase,
+            "frame_num":    frame_num,
+            "timestamp":    dt.strftime("%H:%M:%S.") + f"{dt.microsecond // 1000:03d}",
+            "exp_us":       f"{exp_us:.0f}" if exp_us is not None else "nan",
+            "analogue_gain":f"{ag:.3f}"     if ag      is not None else "nan",
+            "digital_gain": f"{dg:.3f}"     if dg      is not None else "nan",
+            "lux":          f"{lux:.1f}"    if lux     is not None else "nan",
+            "gain_used":    f"{gain_used:.4f}",
+            "centroid":     f"{centroid:.1f}" if centroid is not None else "nan",
+            "occupied":     ";".join(str(z) for z in occupied),
+        }
+        for z in range(self._num_zones):
+            row[f"zm_{z:02d}"] = f"{zone_zm[z]:.3f}" if not np.isnan(zone_zm[z]) else "nan"
+            row[f"zv_{z:02d}"] = f"{zone_zv[z]:.3f}" if not np.isnan(zone_zv[z]) else "nan"
+
+        if not self._active:
+            # Rolling pre-event buffer — keep a sliding window of recent frames.
+            self._pre_buf.append((stem, row))
+        else:
+            self._rows.append(row)
+
+    # ------------------------------------------------------------------
+    def start_event(self):
+        """Call at EVENT START — commits the pre-event buffer and opens the event window."""
+        if self._active:
+            return  # guard against double-start
+        self._active = True
+        self._tail_left = 0
+        # Pull all buffered pre-frames into _rows; remember the earliest stem for the filename.
+        pre_rows = list(self._pre_buf)
+        if pre_rows:
+            self._first_stem = pre_rows[0][0]
+            self._rows = [r for _, r in pre_rows]
+        else:
+            self._first_stem = ""
+            self._rows = []
+        self._pre_buf.clear()
+
+    # ------------------------------------------------------------------
+    def end_event(self):
+        """Call when the event ends (save, timeout, or no-save clear).
+
+        Starts the post-event tail counter; the logger remains active
+        until the tail is exhausted, then auto-flushes.
+        """
+        if not self._active:
+            return
+        self._tail_left = _DEBUG_POST_FRAMES
+
+    # ------------------------------------------------------------------
+    def tick_post(self, stem: str, frame_num: int, dt: datetime,
+                  centroid, occupied: list,
+                  zone_zm: np.ndarray, zone_zv: np.ndarray,
+                  phase: str, meta: dict | None = None,
+                  gain_used: float = 1.0) -> bool:
+        """Record one post-event tail frame. Returns True when tail exhausted and CSV written."""
+        if not self._active or self._tail_left <= 0:
+            return False
+        self.record(stem, frame_num, dt, centroid, occupied, zone_zm, zone_zv, phase, meta, gain_used)
+        self._tail_left -= 1
+        if self._tail_left == 0:
+            self._flush()
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    def flush_now(self):
+        """Force an immediate flush (e.g. on timeout or program exit)."""
+        if self._active and self._rows:
+            self._flush()
+
+    # ------------------------------------------------------------------
+    def reset(self):
+        """Return to pre-event state."""
+        self._active    = False
+        self._tail_left = 0
+        self._rows      = []
+        self._first_stem = ""
+        self._pre_buf.clear()
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    @property
+    def in_tail(self) -> bool:
+        return self._active and self._tail_left > 0
+
+    # ------------------------------------------------------------------
+    def _flush(self):
+        """Write the accumulated rows to a CSV in SHM_DIR and queue for transfer."""
+        if not self._rows:
+            self.reset()
+            return
+        stem = self._first_stem or ts_stem(datetime.now())
+        csv_path = SHM_DIR / f"{stem}_zones.csv"
+        try:
+            SHM_DIR.mkdir(parents=True, exist_ok=True)
+            import csv as _csv
+            fieldnames = (["phase", "frame_num", "timestamp",
+                           "exp_us", "analogue_gain", "digital_gain", "lux",
+                           "gain_used", "centroid", "occupied"]
+                          + [f"zm_{z:02d}" for z in range(self._num_zones)]
+                          + [f"zv_{z:02d}" for z in range(self._num_zones)])
+            with open(csv_path, "w", newline="") as fh:
+                writer = _csv.DictWriter(fh, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(self._rows)
+            log.info("[debug_csv] wrote %d rows → %s", len(self._rows), csv_path.name)
+            _csv_queue.put(csv_path)
+        except Exception as e:
+            log.warning("[debug_csv] failed to write %s: %s", csv_path.name, e)
+        self.reset()
 
 
 # ---------------------------------------------------------------------------
@@ -847,16 +1159,28 @@ def _worker(fmt: str):
 
 class BurstSaver:
     def __init__(self):
-        self.event_num = _load_event_num()
-        if self.event_num:
+        self.event_num, self._last_event_date = _load_event_num()
+        today = datetime.now().strftime("%Y%m%d")
+        if self.event_num and self._last_event_date == today:
             log.info("[event_num] resuming from event %d (today)", self.event_num)
         else:
-            log.info("[event_num] starting fresh event numbering for today")
+            if self.event_num and self._last_event_date != today:
+                log.info("[event_num] new day — resetting event counter")
+            else:
+                log.info("[event_num] starting fresh event numbering for today")
+            self.event_num = 0
+            self._last_event_date = today
 
     def save(self, frames: list[tuple], shm_min_mb: float) -> int:
         """Enqueue pre-saved (npy_path, meta) tuples for conversion.
         Frame arrays are written at capture time (while the request is live);
         this method handles queuing only. Space was already checked at write time."""
+        today = datetime.now().strftime("%Y%m%d")
+        if today != self._last_event_date:
+            log.info("[event_num] date rolled over (%s -> %s) — resetting event counter",
+                     self._last_event_date, today)
+            self.event_num = 0
+            self._last_event_date = today
         self.event_num += 1
         _save_event_num(self.event_num)
         SHM_DIR.mkdir(parents=True, exist_ok=True)
@@ -907,7 +1231,7 @@ def parse_args():
 
 
 def main():
-    print("Burst Capture 2026/5/19 version %s" % VERSION)
+    print("Burst Capture 2026/5/30 version %s" % VERSION)
     args = parse_args()
 
     # --- Start background worker thread (lower OS priority) -----------------
@@ -959,6 +1283,7 @@ def main():
     # --- State --------------------------------------------------------------
     tracker        = ZoneTracker(args.threshold, lores_valid_w)
     saver          = BurstSaver()
+    zone_logger    = ZoneDebugLogger()
     # Rolling 3-frame pre-event buffer: each entry is (npy_path, meta) saved to /dev/shm
     prev_prev_frame: tuple | None = None   # (npy_path, meta) two frames ago
     prev_frame     : tuple | None = None   # (npy_path, meta) one frame ago
@@ -970,6 +1295,10 @@ def main():
     prev_centroid       : float | None = None   # centroid from previous frame
     event_start_centroid: float | None = None   # centroid at EVENT START (for travel check)
     event_anchor_zone   : int   | None = None   # first occupied zone at EVENT START
+    event_anchor_exposure: float       = 1.0    # exp_us * analogue_gain at EVENT START (for ratio correction)
+    oversized_frame_full_saved = False  # True after frame-full save for an oversized vehicle
+    oversized_stash: list | None = None  # [prev_frame, cur_frame] captured at frame-full moment
+    oversized_midpoint_queued: set = set()  # npy paths already queued by midpoint save; must not be unlinked
     cooldown_until = 0.0
     event_count    = 0
     frame_count    = 0
@@ -1001,6 +1330,12 @@ def main():
 
     log.info("Camera started.  Warming up background model (%d frames)…", BG_WARMUP)
 
+    def _exposure_ev(m: dict) -> float:
+        """Return ExposureTime_us * AnalogueGain from frame metadata, or 1.0 if unavailable."""
+        exp = m.get("ExposureTime")
+        ag  = m.get("AnalogueGain", 1.0)
+        return float(exp * ag) if exp is not None else 1.0
+
     t0 = time.monotonic()
     prev_log_time = t0
 
@@ -1028,18 +1363,10 @@ def main():
 
             free_mb = shm_free_mb()
             if free_mb >= args.shm_min_mb:
-                main_arr = request.make_array("main")
-                np.save(str(cur_npy), main_arr)
+                np.save(str(cur_npy), request.make_array("main"))
                 cur_frame = (cur_npy, meta)
             else:
-                main_arr = None
                 cur_frame = None   # can't save; treat as dropped frame
-
-            # Fringe score: only during events, only on vehicle frames (not the
-            # background frame which is event_frame_count == 1).
-            fringe = None
-            if in_event and event_frame_count > 1 and main_arr is not None:
-                fringe = compute_fringe_score(main_arr)
 
         finally:
             # Release the camera request immediately — pixel data is in shm now
@@ -1049,7 +1376,13 @@ def main():
 
         if now < cooldown_until:
             # During cooldown: update zone models, discard saved frame
-            tracker.feed(y_plane, freeze=False)
+            centroid, occupied, reason, zone_zm, zone_zv, gain_used, zv_occupied = tracker.feed(
+                                               y_plane, freeze=False, exposure_ratio=1.0)
+            if zone_logger.in_tail:
+                done = zone_logger.tick_post(stem, frame_count, dt, centroid, occupied,
+                                             zone_zm, zone_zv, "cooldown", meta, gain_used)
+                if done:
+                    zone_logger.reset()
             if cur_frame:
                 cur_frame[0].unlink(missing_ok=True)
             if pre_event_frame:
@@ -1060,8 +1393,15 @@ def main():
             prev_centroid = None
             continue
 
-        centroid, occupied, reason = tracker.feed(y_plane, freeze=in_event,
-                                                   anchor_zone=event_anchor_zone if in_event else None)
+        cur_exposure_ev = _exposure_ev(meta)
+        exposure_ratio  = (cur_exposure_ev / event_anchor_exposure
+                           if in_event and event_anchor_exposure > 0 else 1.0)
+
+        centroid, occupied, reason, zone_zm, zone_zv, gain_used, zv_occupied = tracker.feed(
+                                           y_plane, freeze=in_event,
+                                           anchor_zone=event_anchor_zone if in_event else None,
+                                           hit_threshold=1 if in_event else 3,
+                                           exposure_ratio=exposure_ratio)
 
         if not in_event:
             if occupied:
@@ -1079,9 +1419,25 @@ def main():
                 prev_centroid     = centroid
                 event_start_centroid = centroid
                 event_anchor_zone    = occupied[0]
+                event_anchor_exposure = cur_exposure_ev
+                oversized_frame_full_saved = False
+                oversized_stash        = None
+                oversized_midpoint_queued = set()
+                zone_logger.start_event()
+                zone_logger.record(stem, frame_count, dt, centroid, occupied,
+                                   zone_zm, zone_zv, "event", meta, gain_used)
                 log.info("EVENT START  frame=%d  %s", frame_count, reason)
             else:
                 # Monitoring: roll the 2-frame history forward.
+                # pre-event rolling buffer gets every monitoring frame.
+                if zone_logger.in_tail:
+                    done = zone_logger.tick_post(stem, frame_count, dt, centroid, occupied,
+                                                 zone_zm, zone_zv, "post", meta, gain_used)
+                    if done:
+                        zone_logger.reset()
+                else:
+                    zone_logger.record(stem, frame_count, dt, centroid, occupied,
+                                       zone_zm, zone_zv, "pre", meta, gain_used)
                 # prev_prev_frame is discarded; prev_frame becomes prev_prev_frame;
                 # cur_frame becomes prev_frame.
                 if prev_prev_frame:
@@ -1111,6 +1467,7 @@ def main():
                 if pre_event_frame:
                     pre_event_frame[0].unlink(missing_ok=True)
                     pre_event_frame = None
+                zone_logger.flush_now()
                 tracker.rewarm()
                 in_event          = False
                 event_frame_count = 0
@@ -1119,11 +1476,16 @@ def main():
                 prev_centroid     = None
                 event_start_centroid = None
                 event_anchor_zone    = None
+                event_anchor_exposure = 1.0
+                oversized_frame_full_saved = False
+                oversized_stash        = None
+                oversized_midpoint_queued = set()
                 cooldown_until    = now + args.cooldown
                 continue
 
-            fringe_tag = f"  fringe={fringe:.2f}" if fringe is not None else ""
-            log.info("  event frame %d  %s%s", event_frame_count, reason, fringe_tag)
+            log.info("  event frame %d  %s", event_frame_count, reason)
+            zone_logger.record(stem, frame_count, dt, centroid, occupied,
+                               zone_zm, zone_zv, "event", meta, gain_used)
 
             if not occupied:
                 # Vehicle has cleared all zones.
@@ -1133,7 +1495,7 @@ def main():
                           if prev_centroid is not None and event_start_centroid is not None
                           else 0.0)
                 if (event_frame_count >= 3 and travel >= EVENT_MIN_TRAVEL
-                        and prev_frame and cur_frame):
+                        and prev_frame and cur_frame and pre_event_frame is not None):
                     had_pre = pre_event_frame is not None
                     frames_to_save = ([pre_event_frame] if pre_event_frame else []) + [prev_frame, cur_frame]
                     n = saver.save(frames_to_save, args.shm_min_mb)
@@ -1143,7 +1505,7 @@ def main():
                              travel, saver.event_num, "yes" if had_pre else "no")
                     log.info("Event %d queued for conversion (%d frames)", event_count, n)
                 else:
-                    log.info("EVENT END (no save — centroid did not cross midpoint, travel=%.0fpx)", travel)
+                    log.info("EVENT END (no save, travel=%.0fpx) pre_event=%s", travel, "yes" if pre_event_frame else "no")
                     if cur_frame:
                         cur_frame[0].unlink(missing_ok=True)
                     if prev_frame:
@@ -1151,7 +1513,8 @@ def main():
                     if pre_event_frame:
                         pre_event_frame[0].unlink(missing_ok=True)
                         pre_event_frame = None
-                tracker.reanchor(4)
+                zone_logger.end_event()
+                # tracker.reanchor(4)
                 in_event          = False
                 event_frame_count = 0
                 prev_frame        = None
@@ -1159,12 +1522,90 @@ def main():
                 prev_centroid     = None
                 event_start_centroid = None
                 event_anchor_zone    = None
-                cooldown_until    = now + args.cooldown
+                event_anchor_exposure = 1.0
+                oversized_frame_full_saved = False
+                oversized_stash        = None
+                oversized_midpoint_queued = set()
+                cooldown_until    = now + (args.cooldown if event_frame_count > 2 else 0.0)
+                continue
+
+            # Check for oversized vehicle: uses zv-hot zone count rather than the
+            # zm+zv trigger-occupied count, so road shadows don't inflate the size estimate.
+            frame_full = len(zv_occupied) >= ZV_OVERSIZED_ZONES
+
+            if frame_full and not oversized_frame_full_saved:
+                # Vehicle has just filled the frame — stash this pair; do not save yet.
+                # We'll combine it with the exit pair into a single 4-frame event later.
+                if prev_frame and cur_frame:
+                    had_pre = pre_event_frame is not None
+                    oversized_stash = (([pre_event_frame] if pre_event_frame else [])
+                                       + [prev_frame, cur_frame])
+                    pre_event_frame = None
+                    oversized_frame_full_saved = True
+                    log.info("[oversized] frame-full stashed  zv_zones=%d  pre_event=%s",
+                             len(zv_occupied), "yes" if had_pre else "no")
+                else:
+                    log.warning("[event] frame-full but frame(s) missing (shm low?); skipping stash")
+                    oversized_frame_full_saved = True  # arm exit detection anyway
+                # Keep rolling — wait for frame-exit trigger.
+                # Do NOT unlink prev_frame if it was just stashed — it will be
+                # consumed by the worker when the exit pair is saved.
+                stashed_paths = {f[0] for f in oversized_stash} if oversized_stash else set()
+                if (prev_frame and prev_frame[0] != (cur_frame[0] if cur_frame else None)
+                        and prev_frame[0] not in stashed_paths):
+                    prev_frame[0].unlink(missing_ok=True)
+                prev_frame    = cur_frame
+                prev_centroid = centroid
+                continue
+
+            if oversized_frame_full_saved and not frame_full:
+                # Vehicle is starting to leave — combine stash + exit frame into one event.
+                # prev_frame here is always the same file as the last frame of the stash
+                # (set by `prev_frame = cur_frame` in the frame-full branch), so only
+                # append cur_frame to avoid a duplicate entry in the job.
+                if oversized_stash and prev_frame and cur_frame:
+                    frames_to_save = oversized_stash + [cur_frame]
+                    # prev_frame is only equal to stash[-1] when the exit fires on the
+                    # very first post-stash frame.  If rolling frames intervened it has
+                    # advanced and holds an npy that is not queued — unlink it now.
+                    stashed_paths = {f[0] for f in oversized_stash}
+                    if prev_frame[0] not in stashed_paths and prev_frame[0] != cur_frame[0]:
+                        prev_frame[0].unlink(missing_ok=True)
+                    n = saver.save(frames_to_save, args.shm_min_mb)
+                    event_count += 1
+                    log.info("SAVE (oversized 4-frame)  event=%d  total_frames=%d  exit_zv_zones=%d",
+                             saver.event_num, n, len(zv_occupied))
+                    log.info("Event %d queued for conversion (%d frames)", event_count, n)
+                else:
+                    log.warning("[event] frame-exit but stash or frame(s) missing; skipping save")
+                    if cur_frame and cur_frame[0] not in oversized_midpoint_queued:
+                        cur_frame[0].unlink(missing_ok=True)
+                    if prev_frame and prev_frame[0] not in oversized_midpoint_queued:
+                        prev_frame[0].unlink(missing_ok=True)
+                    if oversized_stash:
+                        for f in oversized_stash:
+                            if f[0] not in oversized_midpoint_queued:
+                                f[0].unlink(missing_ok=True)
+                in_event               = False
+                event_frame_count      = 0
+                prev_frame             = None
+                prev_prev_frame        = None
+                pre_event_frame        = None
+                prev_centroid          = None
+                event_start_centroid   = None
+                event_anchor_zone      = None
+                event_anchor_exposure  = 1.0
+                oversized_frame_full_saved = False
+                oversized_stash        = None
+                oversized_midpoint_queued = set()
+                cooldown_until         = now + args.cooldown
+                zone_logger.end_event()
                 continue
 
             # Check for midpoint crossing:
             #   - must be at least the 3rd event frame (filter pedestrians / short blips)
             #   - centroid must have moved past the frame midpoint this frame
+            #   - skipped for oversized vehicles (handled above)
             frame_center = tracker.frame_center
             crossed = (centroid is not None and prev_centroid is not None
                        and event_frame_count >= 3
@@ -1178,7 +1619,8 @@ def main():
                     n = saver.save(frames_to_save, args.shm_min_mb)
                     pre_event_frame = None
                     event_count += 1
-                    log.info("SAVE  event=%d  pre_event=%s  prev_offset=%+.0f  cur_offset=%+.0f",
+                    log.info("SAVE%s  event=%d  pre_event=%s  prev_offset=%+.0f  cur_offset=%+.0f",
+                             " (oversized midpoint)" if frame_full else "",
                              saver.event_num,
                              "yes" if had_pre else "no",
                              prev_centroid - frame_center,
@@ -1203,7 +1645,24 @@ def main():
                     except Exception as _e:
                         log.warning("[debug] lores snapshot failed: %s", _e)
 
-                tracker.reanchor(4)
+                # For oversized vehicles keep the event running so the frame-exit save
+                # can still fire.  Just discard pre_event_frame (already saved) and
+                # arm the oversized stash machinery.
+                if frame_full:
+                    pre_event_frame = None
+                    oversized_frame_full_saved = True   # skip the stash; go straight to exit watch
+                    oversized_stash = None
+                    # Track npy paths queued by the midpoint save so the frame-exit
+                    # else-branch cannot unlink them and cause a worker FileNotFoundError.
+                    # frames_to_save is defined above in the `if prev_frame and cur_frame`
+                    # branch; if that branch was skipped (shm low) there is nothing queued.
+                    oversized_midpoint_queued = ({f[0] for f in frames_to_save}
+                                                 if prev_frame and cur_frame else set())
+                    prev_frame    = cur_frame
+                    prev_centroid = centroid
+                    continue
+
+                # tracker.reanchor(4)
                 in_event          = False
                 event_frame_count = 0
                 prev_frame        = None
@@ -1212,17 +1671,27 @@ def main():
                 prev_centroid     = None
                 event_start_centroid = None
                 event_anchor_zone    = None
+                event_anchor_exposure = 1.0
+                oversized_frame_full_saved = False
+                oversized_stash        = None
+                oversized_midpoint_queued = set()
                 cooldown_until    = now + args.cooldown
+                zone_logger.end_event()
                 continue
 
             # Centroid hasn't crossed yet — keep rolling
-            # Discard the frame before prev_frame (no longer needed)
-            if prev_frame and prev_frame[0] != (cur_frame[0] if cur_frame else None):
+            # Discard the frame before prev_frame (no longer needed),
+            # but only if it hasn't been stashed for an oversized event.
+            stashed_paths = {f[0] for f in oversized_stash} if oversized_stash else set()
+            if (prev_frame and prev_frame[0] != (cur_frame[0] if cur_frame else None)
+                    and prev_frame[0] not in stashed_paths):
                 prev_frame[0].unlink(missing_ok=True)
             prev_frame    = cur_frame
             prev_centroid = centroid
 
     picam2.stop()
+
+    zone_logger.flush_now()   # write any partial event CSV before exiting
 
     # Signal worker to exit; if interrupted, stop_event is already set and
     # the worker will bail out without draining remaining jobs.
