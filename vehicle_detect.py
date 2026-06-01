@@ -30,7 +30,7 @@ from picamera2 import Picamera2
 # Configuration
 # ---------------------------------------------------------------------------
 
-VERSION        = "1.020"
+VERSION        = "1.029"
 FRAME_RATE     = 20.0
 LORES_SIZE     = (320, 240)
 HIRES_SIZE     = (1456, 1088)
@@ -45,7 +45,7 @@ SHM_MIN_MB     = 100
 REMOTE_HOST    = "jbeale@jbeale-mini.local"
 REMOTE_DIR     = "/mnt/bluecherry/CAMA/"
 
-PRINT_INTERVAL = 300   # frames between status log lines
+PRINT_INTERVAL = 1200   # frames between status log lines (~1 minute at 20fps)
 
 EVENT_NUM_FILE = Path("/tmp/vehicle_detect_event_num.txt")  # daily event counter
 
@@ -84,9 +84,9 @@ MORPH_KERNEL_SIZE = 5
 MIN_BLOB_AREA       = 100 # catch smaller objects like bicyclists
 MIN_ASPECT_RATIO    = 0.8
 MIN_BLOB_WIDTH      = 50
-MIN_BLOB_HEIGHT     = 40
-MIN_HULL_FILL_RATIO = 0.35
-MIN_CENTROID_AREA   = 3000
+MIN_BLOB_HEIGHT     = 20   # to see dark cars in shadows, reduce to 25 (was 40)
+MIN_HULL_FILL_RATIO = 0.44 # was 0.35   
+MIN_CENTROID_AREA   = 800 # was 3000, to see motorcycles and bicyclists
 
 # Minimum foreground pixel count to log when --verbose-fg is active.
 VERBOSE_FG_MIN_PIXELS = 150
@@ -94,8 +94,16 @@ VERBOSE_FG_MIN_PIXELS = 150
 MIN_CONSECUTIVE_FRAMES = 4
 LOCKOUT_FRAMES         = 15
 
-LR_NORMAL  = 0.005
+LR_NORMAL  = 0.002
 LR_VEHICLE = 0.0
+
+# Two-stage learning rate boost when AGC is stuck unsettled.
+# Stage 1: moderate boost after LR_BOOST_AFTER frames.
+# Stage 2: aggressive boost after LR_BOOST2_AFTER frames to force convergence.
+LR_BOOST            = 0.05
+LR_BOOST_AFTER      = 120   # frames (~6 seconds at 20fps)
+LR_BOOST2           = 0.5
+LR_BOOST2_AFTER     = 600   # frames (~30 seconds at 20fps)
 
 # Correction factor must be within this fraction of 1.0 for MOG2 to resume
 # learning. Widened from 0.02 to allow adaptation after sustained exposure shifts.
@@ -436,6 +444,7 @@ def main():
     best_center_dist      = float('inf')
     best_center_cx        = None
     max_blob_width        = 0      # max hull width seen during this event
+    stuck_frames          = 0      # frames of continuous non-vehicle fg activity
     frame_count           = 0
     fi                    = 0      # detection frame index (increments every frame)
 
@@ -507,7 +516,27 @@ def main():
 
         # MOG2 — freeze learning during vehicle or AGC recovery
         agc_settled = abs(factor - 1.0) < AGC_SETTLED_THRESHOLD
-        lr = LR_NORMAL if (not vehicle_active and agc_settled) else LR_VEHICLE
+
+        if vehicle_active:
+            lr = LR_VEHICLE
+            stuck_frames = 0
+        elif agc_settled:
+            lr = LR_NORMAL
+            stuck_frames = 0
+        else:
+            stuck_frames += 1
+            if stuck_frames >= LR_BOOST2_AFTER:
+                lr = LR_BOOST2
+                if stuck_frames == LR_BOOST2_AFTER:
+                    log.info("[adapt] stuck %d frames (factor=%.4f) — stage-2 boost LR=%.2f",
+                             stuck_frames, factor, LR_BOOST2)
+            elif stuck_frames >= LR_BOOST_AFTER:
+                lr = LR_BOOST
+                if stuck_frames == LR_BOOST_AFTER:
+                    log.info("[adapt] stuck %d frames (factor=%.4f) — stage-1 boost LR=%.3f",
+                             stuck_frames, factor, LR_BOOST)
+            else:
+                lr = LR_VEHICLE
         fg_mask = fgbg.apply(roi, learningRate=lr)
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN,  kernel)
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
@@ -623,6 +652,7 @@ def main():
             best_center_dist      = float('inf')
             best_center_cx        = None
             max_blob_width        = 0
+            stuck_frames          = 0
             lockout_remaining     = LOCKOUT_FRAMES
 
         elif not blob:
