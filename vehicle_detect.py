@@ -5,6 +5,8 @@ vehicle_detect.py  —  MOG2-based vehicle detection with centered-frame capture
 Runs continuously, monitoring the lores stream for vehicles crossing the frame.
 When a vehicle event ends, saves the two high-res frames closest to the estimated
 center position to /dev/shm/burst/, then rsyncs them to a remote host.
+Configured for IMX296 (global shutter) camera
+
 
 Usage:
     python3 vehicle_detect.py [--tune FILE] [--shutter US] [--gain G] [--ev EV]
@@ -30,7 +32,7 @@ from picamera2 import Picamera2
 # Configuration
 # ---------------------------------------------------------------------------
 
-VERSION        = "1.029"
+VERSION        = "1.031"
 FRAME_RATE     = 20.0
 LORES_SIZE     = (320, 240)
 HIRES_SIZE     = (1456, 1088)
@@ -84,8 +86,8 @@ MORPH_KERNEL_SIZE = 5
 MIN_BLOB_AREA       = 100 # catch smaller objects like bicyclists
 MIN_ASPECT_RATIO    = 0.8
 MIN_BLOB_WIDTH      = 50
-MIN_BLOB_HEIGHT     = 20   # to see dark cars in shadows, reduce to 25 (was 40)
-MIN_HULL_FILL_RATIO = 0.44 # was 0.35   
+MIN_BLOB_HEIGHT     = 20   # lowered from 25 to avoid intermittent streak resets on dark cars
+MIN_HULL_FILL_RATIO = 0.44 # lowered from 0.45 to avoid boundary ties
 MIN_CENTROID_AREA   = 800 # was 3000, to see motorcycles and bicyclists
 
 # Minimum foreground pixel count to log when --verbose-fg is active.
@@ -93,6 +95,11 @@ VERBOSE_FG_MIN_PIXELS = 150
 
 MIN_CONSECUTIVE_FRAMES = 4
 LOCKOUT_FRAMES         = 15
+
+# Minimum centroid travel (lores px) across the full event to accept it as a
+# real vehicle pass. Stationary or near-stationary blobs (e.g. lighting artefacts)
+# are discarded and trigger a background reset.
+MIN_CENTROID_TRAVEL = 80
 
 LR_NORMAL  = 0.002
 LR_VEHICLE = 0.0
@@ -496,7 +503,8 @@ def main():
         dg     = delayed_meta.get("DigitalGain")   or 1.0
         ev     = float(exp) * float(ag) * float(dg)
 
-        # Baseline EV anchored to first frame
+        # Baseline EV anchored to first frame; re-anchored after prolonged
+        # unsettled state to handle gradual lighting changes (e.g. sunset).
         if frame_count == 1:
             ev_baseline = ev
         factor = ev_baseline / ev if ev > 0 else 1.0
@@ -514,7 +522,9 @@ def main():
         color = apply_correction(lores_bgr, factor)
         roi   = color[ROI_TOP:ROI_BOTTOM, :]
 
-        # MOG2 — freeze learning during vehicle or AGC recovery
+        # MOG2 learning rate — freeze during vehicle events; boost when AGC
+        # is stuck unsettled; re-anchor ev_baseline after stage-2 boost so
+        # gradual lighting changes (sunset) don't keep the factor permanently off.
         agc_settled = abs(factor - 1.0) < AGC_SETTLED_THRESHOLD
 
         if vehicle_active:
@@ -530,6 +540,16 @@ def main():
                 if stuck_frames == LR_BOOST2_AFTER:
                     log.info("[adapt] stuck %d frames (factor=%.4f) — stage-2 boost LR=%.2f",
                              stuck_frames, factor, LR_BOOST2)
+                # After running stage-2 boost for a full LR_BOOST2_AFTER interval,
+                # re-anchor the baseline so factor returns near 1.0 and normal
+                # operation can resume. This handles gradual lighting drift.
+                if stuck_frames >= LR_BOOST2_AFTER * 2:
+                    ev_baseline = ev
+                    stuck_frames = 0
+                    lr = LR_NORMAL
+                    log.info("[adapt] re-anchoring ev_baseline=%.1f after prolonged boost", ev)
+                else:
+                    lr = LR_BOOST2
             elif stuck_frames >= LR_BOOST_AFTER:
                 lr = LR_BOOST
                 if stuck_frames == LR_BOOST_AFTER:
@@ -612,13 +632,28 @@ def main():
                 chosen_fi = best_center_idx
                 chosen_by = "centroid proximity"
 
-            log.info("VEHICLE END  event=%d  best_fi=%s  pred=%.1f  src=%s  by=%s",
+            # Check centroid travel before logging or saving
+            cx_vals = [cx for _, cx, _ in centroid_history]
+            travel  = (max(cx_vals) - min(cx_vals)) if len(cx_vals) >= 2 else 0.0
+
+            log.info("VEHICLE END  event=%d  best_fi=%s  pred=%.1f  src=%s  by=%s  travel=%.1f",
                      event_count + 1,
                      chosen_fi if chosen_fi is not None else '–',
                      pred if pred is not None else float('nan'),
-                     src, chosen_by)
+                     src, chosen_by, travel)
 
-            if chosen_fi is not None and hires_buf:
+            # Check centroid travel — stationary blobs are lighting artefacts, not vehicles.
+
+            if travel < MIN_CENTROID_TRAVEL:
+                log.warning("VEHICLE DISCARDED  travel=%.1f < %d — likely false trigger; "
+                            "resetting background model", travel, MIN_CENTROID_TRAVEL)
+                # Force MOG2 to rapidly re-learn the current frame as background
+                for _ in range(20):
+                    fgbg.apply(roi, learningRate=0.5)
+                ev_baseline = ev   # re-anchor EV baseline to current exposure
+                stuck_frames = 0
+
+            elif chosen_fi is not None and hires_buf:
                 # Pick two buffer entries whose fi is closest to chosen_fi,
                 # adjusted for any hires/lores pipeline lag, with an extra
                 # offset for long vehicles so the front hasn't yet exited.
