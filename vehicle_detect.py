@@ -121,6 +121,13 @@ MIN_MOTION_CONSISTENCY = 0.2
 # without affecting the net displacement or normal per-frame steps.
 MAX_STEP_FOR_CONSISTENCY = 160
 
+# Minimum standard deviation of cx (lores px) over the last STATIONARY_TAIL_N
+# confirmed frames.  A stationary foreground object shows near-zero cx variance
+# across its final frames and always triggers a timeout; real vehicles do not.
+# Long vehicles (max_blob_width >= HIRES_LONG_VEHICLE_WIDTH) are exempt.
+# Set to 0 to disable.
+MIN_CONFIRMED_CX_STD = 5.0
+
 # Minimum backward centroid step (lores px) that signals a tow-vehicle/trailer
 # split: when the dominant blob switches from the lead vehicle (exiting one side)
 # to the trailer (still crossing), the centroid jumps back against the direction
@@ -478,27 +485,22 @@ def find_vehicle_blob(mask):
 def estimate_center_frame(centroid_history):
     """
     Linear fit of centroid_x vs frame_index.
-    Returns (predicted_fi: float, used_interior: bool, fi_min: float, fi_max: float)
-    or (None, False, None, None).
-    fi_min/fi_max are the fi range of the subset used for fitting; the prediction
-    is only reliable within this range (extrapolation beyond it should be rejected).
+    Returns (predicted_fi: float, used_interior: bool) or (None, False).
     """
     interior = [(fi, cx) for fi, cx, full in centroid_history if full]
     subset   = interior if len(interior) >= 4 else \
                [(fi, cx) for fi, cx, _ in centroid_history] \
                if len(centroid_history) >= 4 else None
     if subset is None:
-        return None, False, None, None
+        return None, False
 
     used_interior = (subset is interior)
     idx    = np.array([s[0] for s in subset], dtype=np.float32)
     xs     = np.array([s[1] for s in subset], dtype=np.float32)
     coeffs = np.polyfit(idx, xs, 1)
     if abs(coeffs[0]) < 1e-3:
-        return None, False, None, None
-    fi_min_fit = float(idx.min())
-    fi_max_fit = float(idx.max())
-    return (FRAME_WIDTH / 2.0 - coeffs[1]) / coeffs[0], used_interior, fi_min_fit, fi_max_fit
+        return None, False
+    return (FRAME_WIDTH / 2.0 - coeffs[1]) / coeffs[0], used_interior
 
 def split_centroid_history(centroid_history):
     """
@@ -529,15 +531,15 @@ def pick_and_save(phase_history, vehicle_frame_indices, hires_buf,
     fi_bbox maps fi → lores bbox for precise per-frame blur.
     Returns True if save was initiated.
     """
-    pred, used_int, fi_min_fit, fi_max_fit = estimate_center_frame(phase_history)
+    pred, used_int = estimate_center_frame(phase_history)
     src = "interior" if used_int else "fallback"
 
     phase_fis = [fi for fi, _, _ in phase_history]
     fi_min = min(phase_fis) if phase_fis else None
     fi_max = max(phase_fis) if phase_fis else None
 
-    if (pred is not None and fi_min_fit is not None
-            and fi_min_fit <= pred <= fi_max_fit):
+    if (pred is not None and fi_min is not None
+            and fi_min <= pred <= fi_max):
         chosen_fi = min(vehicle_frame_indices, key=lambda i: abs(i - pred),
                         default=None)
         chosen_by = f"linear fit ({src})"
@@ -914,15 +916,13 @@ def main():
 
         if not blob and vehicle_active:
             # --- Vehicle event ended -----------------------------------------
-            pred, used_int, fi_min_fit, fi_max_fit = estimate_center_frame(centroid_history)
+            pred, used_int = estimate_center_frame(centroid_history)
             src = "interior" if used_int else "fallback"
 
-            # Accept the linear fit prediction only if it falls within the fi range
-            # of the frames used for fitting (not just any vehicle frame).
-            # Extrapolation beyond the fitted subset means the vehicle crossed centre
-            # before/after we had interior observations — use best_center_idx instead.
-            if (pred is not None and fi_min_fit is not None
-                    and fi_min_fit <= pred <= fi_max_fit):
+            # Select best frame index using linear fit if available and
+            # prediction falls within the observed vehicle frame range.
+            if (pred is not None and vehicle_frame_indices and
+                    min(vehicle_frame_indices) <= pred <= max(vehicle_frame_indices)):
                 chosen_fi = min(vehicle_frame_indices, key=lambda i: abs(i - pred))
                 chosen_by = f"linear fit ({src})"
             else:
@@ -961,21 +961,47 @@ def main():
             n_cx = len(cx_vals)
             # Direction of travel for leading-edge blur margin
             rightward = (cx_vals[-1] >= cx_vals[0]) if n_cx >= 2 else True
+
+            # Stationarity check on the tail of confirmed frames.
+            # A stationary foreground object (parked car, shadow, post) shows
+            # near-zero cx variance in its final confirmed frames and always
+            # triggers a timeout.  Real vehicles are still moving (or just exited)
+            # at event end, so their tail cx std is well above threshold.
+            # Long vehicles (max_blob_width >= HIRES_LONG_VEHICLE_WIDTH) are exempt:
+            # their blob spans the full frame width, producing few or no interior
+            # (fully_interior) centroid points, and a steady cx is expected while
+            # the vehicle fills the frame.
+            STATIONARY_TAIL_N = 10
+            is_long_vehicle = max_blob_width >= HIRES_LONG_VEHICLE_WIDTH
+            confirmed_fi_set = set(vehicle_frame_indices)
+            confirmed_cx = [cx for fi, cx, _ in centroid_history if fi in confirmed_fi_set]
+            if (MIN_CONFIRMED_CX_STD > 0
+                    and not is_long_vehicle
+                    and len(confirmed_cx) >= STATIONARY_TAIL_N):
+                tail_cx = confirmed_cx[-STATIONARY_TAIL_N:]
+                confirmed_cx_std = float(np.std(tail_cx))
+                stationary = confirmed_cx_std < MIN_CONFIRMED_CX_STD
+            else:
+                confirmed_cx_std = None
+                stationary = False
+
             if n_cx >= 4:
                 steps      = [cx_vals[i] - cx_vals[i - 1] for i in range(1, n_cx)]
                 path_len   = sum(min(abs(s), MAX_STEP_FOR_CONSISTENCY) for s in steps)
                 net_disp   = abs(cx_vals[-1] - cx_vals[0])
                 consistency = (net_disp / path_len) if path_len > 0 else 0.0
                 travel      = max(cx_vals) - min(cx_vals)   # kept for log only
-                motion_ok   = valid_split or consistency >= MIN_MOTION_CONSISTENCY
+                motion_ok   = (not stationary) and (valid_split or consistency >= MIN_MOTION_CONSISTENCY)
                 motion_desc = (f"consistency={consistency:.2f}  "
                                f"net={net_disp:.1f}  path={path_len:.1f}  "
-                               f"travel={travel:.1f}")
+                               f"travel={travel:.1f}"
+                               + (f"  cx_std={confirmed_cx_std:.1f}" if confirmed_cx_std is not None else ""))
             else:
                 travel      = (max(cx_vals) - min(cx_vals)) if n_cx >= 2 else 0.0
                 consistency = None
-                motion_ok   = valid_split or travel >= MIN_CENTROID_TRAVEL
-                motion_desc = f"travel={travel:.1f}  (short history, n={n_cx})"
+                motion_ok   = (not stationary) and (valid_split or travel >= MIN_CENTROID_TRAVEL)
+                motion_desc = (f"travel={travel:.1f}  (short history, n={n_cx})"
+                               + (f"  cx_std={confirmed_cx_std:.1f}" if confirmed_cx_std is not None else ""))
 
             log.info("VEHICLE END  event=%d  best_fi=%s  pred=%.1f  src=%s  by=%s  %s",
                      event_count + 1,
@@ -984,8 +1010,9 @@ def main():
                      src, chosen_by, motion_desc)
 
             if not motion_ok:
-                log.warning("VEHICLE DISCARDED  %s — likely false trigger; "
-                            "resetting background model", motion_desc)
+                reason = "stationary object" if stationary else "likely false trigger"
+                log.warning("VEHICLE DISCARDED  %s — %s; "
+                            "resetting background model", motion_desc, reason)
                 # Force MOG2 to rapidly re-learn the current frame as background
                 for _ in range(20):
                     fgbg.apply(roi, learningRate=0.5)
