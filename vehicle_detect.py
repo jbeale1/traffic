@@ -12,6 +12,7 @@ Usage:
     python3 vehicle_detect.py [--tune FILE] [--shutter US] [--gain G] [--ev EV]
 """
 
+import math
 import argparse
 import collections
 import csv
@@ -25,6 +26,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image
 from libcamera import Transform, controls as libctrls
 from picamera2 import Picamera2
 
@@ -32,7 +34,7 @@ from picamera2 import Picamera2
 # Configuration
 # ---------------------------------------------------------------------------
 
-VERSION        = "1.031"
+VERSION        = "1.058"
 FRAME_RATE     = 20.0
 LORES_SIZE     = (320, 240)
 HIRES_SIZE     = (1456, 1088)
@@ -42,12 +44,20 @@ JPEG_QUALITY   = 95
 HIRES_CROP_TOP    = 76
 HIRES_CROP_BOTTOM = 830
 
+# Background blur applied outside the vehicle bounding box before JPEG save.
+# Reduces file size by softening high-frequency background (trees, grass, etc.).
+BLUR_KERNEL_SIZE  = 7     # must be odd; 7x7 Gaussian
+BLUR_MARGIN_HIRES = 20    # unblurred padding around vehicle bbox (hires pixels)
+BLUR_LEAD_MARGIN_HIRES = 200  # extra unblurred margin on the leading edge (front of vehicle)
+BLUR_TRAIL_MARGIN_HIRES = 100  # extra unblurred margin on the trailing edge (rear of vehicle)
+# Lores-to-hires scale factors for IMX296 (1456x1088 hires, 320x240 lores)
+LORES_TO_HIRES_X  = 1456 / 320
+LORES_TO_HIRES_Y  = 1088 / 240
+
 SHM_BASE       = Path("/dev/shm/burst")
 SHM_MIN_MB     = 100
 REMOTE_HOST    = "jbeale@jbeale-mini.local"
 REMOTE_DIR     = "/mnt/bluecherry/CAMA/"
-
-PRINT_INTERVAL = 1200   # frames between status log lines (~1 minute at 20fps)
 
 EVENT_NUM_FILE = Path("/tmp/vehicle_detect_event_num.txt")  # daily event counter
 
@@ -96,10 +106,26 @@ VERBOSE_FG_MIN_PIXELS = 150
 MIN_CONSECUTIVE_FRAMES = 4
 LOCKOUT_FRAMES         = 15
 
-# Minimum centroid travel (lores px) across the full event to accept it as a
-# real vehicle pass. Stationary or near-stationary blobs (e.g. lighting artefacts)
-# are discarded and trigger a background reset.
+# Minimum centroid travel (lores px) for short centroid histories (< 4 points)
+# where directional consistency cannot be meaningfully computed.
 MIN_CENTROID_TRAVEL = 80
+
+# Minimum directional consistency for centroid histories of 4+ points.
+# Defined as |net_displacement| / total_path_length: 1.0 = perfectly monotonic,
+# 0.0 = pure random jitter.  A truck+trailer sawtooth still scores high because
+# each phase is internally monotonic.  Shadow flicker scores near zero.
+MIN_MOTION_CONSISTENCY = 0.2
+
+# Steps larger than this (lores px) are clipped before summing path length for
+# the consistency metric.  Suppresses outlier blob jumps (e.g. from AGC transients)
+# without affecting the net displacement or normal per-frame steps.
+MAX_STEP_FOR_CONSISTENCY = 160
+
+# Minimum backward centroid step (lores px) that signals a tow-vehicle/trailer
+# split: when the dominant blob switches from the lead vehicle (exiting one side)
+# to the trailer (still crossing), the centroid jumps back against the direction
+# of travel.  50 px is ~15 % of frame width, large enough to avoid noise.
+CENTROID_REVERSAL_THRESHOLD = 50
 
 LR_NORMAL  = 0.002
 LR_VEHICLE = 0.0
@@ -124,22 +150,23 @@ FRAME_WIDTH  = LORES_SIZE[0]
 METADATA_DELAY_FRAMES = 2
 
 # Maximum event duration before forced close and background re-adaptation
-MAX_EVENT_FRAMES = int(FRAME_RATE * 8)   # 8 seconds
+MAX_EVENT_FRAMES = int(FRAME_RATE * 2.5)  # 2.5 seconds — coordinated with HIRES_BUFFER_SIZE
 
 # Rolling buffer of high-res frames kept in RAM.
 # Must be large enough to reach back to the best-centered frame even after
 # the vehicle has fully exited. At 20fps and up to ~3s visible, 60 frames
 # (270 MB at 1456x1088 BGR) gives ample headroom within the 2 GB /dev/shm.
 HIRES_BUFFER_SIZE = 60
+# Maximum fi distance between the target frame and the closest available buffer
+# entry.  If the gap exceeds this, the vehicle has already left the buffer and
+# saving would produce frames from the wrong (stationary) phase.
+MAX_FI_SAVE_GAP  = 40   # frames (~2s at 20fps)
 
 # Offset (in frames) applied to chosen_fi when selecting from hires_buf.
 # Set negative if hires frames appear to lag lores detection.
 HIRES_LAG_FRAMES = 0
 
-# For long vehicles (hull width >= HIRES_LONG_VEHICLE_WIDTH lores px),
-# apply this additional offset so the front hasn't yet exited the frame.
-HIRES_LAG_LONG_FRAMES    = -1
-HIRES_LONG_VEHICLE_WIDTH = 300  # lores px
+HIRES_LONG_VEHICLE_WIDTH = 300  # lores px — vehicle is "long" if max blob width reaches this
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -236,9 +263,105 @@ def start_transfer():
 # Save thread
 # ---------------------------------------------------------------------------
 
-def _save_and_transfer(frames, event_count):
+def _build_exif(meta: dict):
+    """Build a Pillow ExifData object from libcamera metadata.
+
+    Tags that are SRATIONAL (signed rational) -- ShutterSpeedValue, BrightnessValue,
+    CameraTemperature -- must go into the Exif sub-IFD (0x8769) via get_ifd(), not the
+    top-level dict, because Pillow encodes top-level rationals as unsigned RATIONAL.
     """
-    frames: list of (hires_bgr, stem) to save as JPEGs.
+    exif = Image.Exif()
+    ifd  = exif.get_ifd(0x8769)   # Exif sub-IFD
+
+    # ExposureTime: us -> seconds as RATIONAL (tag 0x829A, top-level IFD0)
+    exp_us = meta.get("ExposureTime")
+    if exp_us is not None:
+        exif[0x829A] = (int(exp_us), 1_000_000)
+        # ShutterSpeedValue: APEX Tv = log2(1/t_s), SRATIONAL x1000 (tag 0x9201, Exif IFD)
+        if exp_us > 0:
+            apex_tv = math.log2(1_000_000 / exp_us)
+            ifd[0x9201] = (int(round(apex_tv * 1000)), 1000)
+
+    # Lux -> APEX BrightnessValue: Bv = log2(lux/2.5), SRATIONAL x100 (tag 0x9203, Exif IFD)
+    lux = meta.get("Lux")
+    if lux is not None and lux > 0:
+        bv = math.log2(lux / 2.5)
+        ifd[0x9203] = (int(round(bv * 100)), 100)
+
+    # AnalogueGain -> ISOSpeedRatings (tag 0x8827, Exif IFD), SHORT
+    gain = meta.get("AnalogueGain")
+    if gain is not None:
+        ifd[0x8827] = int(round(gain * 100))
+
+    # SensorTemperature -> CameraTemperature (tag 0x9400, Exif IFD), SRATIONAL degC x10
+    temp = meta.get("SensorTemperature")
+    if temp is not None:
+        ifd[0x9400] = (int(round(temp * 10)), 10)
+
+    # ImageDescription: human-readable lux + temperature for viewers that show IFD0 only
+    desc_parts = []
+    if lux is not None:
+        desc_parts.append(f"Lux={lux:.1f}")
+    if temp is not None:
+        desc_parts.append(f"SensorTemp={temp:.1f}C")
+    if desc_parts:
+        exif[0x010E] = " ".join(desc_parts)   # ImageDescription, top-level IFD0
+
+    return exif
+
+
+def _select_frames(hires_buf, target_fi, n=2):
+    """
+    Pick n hires buffer entries nearest to target_fi.
+    Returns the sorted list, or None if the closest entry is more than
+    MAX_FI_SAVE_GAP frames away (vehicle has left the buffer window).
+    """
+    if not hires_buf:
+        return None
+    buf_list = sorted(hires_buf, key=lambda e: abs(e[3] - target_fi))
+    if abs(buf_list[0][3] - target_fi) > MAX_FI_SAVE_GAP:
+        return None
+    return sorted(buf_list[:n], key=lambda e: e[3])
+
+
+def blur_background(hires_bgr, bbox_lores, rightward=True):
+    """
+    Apply a Gaussian blur to everything outside the vehicle bounding box.
+    bbox_lores is (bx, by, bw, bh) in lores coordinates, or None (no blur).
+    rightward indicates direction of travel; the leading edge gets an extra
+    BLUR_LEAD_MARGIN_HIRES pixels of unblurred space to cover the vehicle front.
+    Returns a new image with background softened.
+    """
+    if bbox_lores is None:
+        return hires_bgr
+
+    bx, by, bw, bh = bbox_lores
+    # Vertical extent only — unblurred region spans the full image width.
+    # by is relative to ROI_TOP (blob detection runs on the ROI crop),
+    # so restore full-lores y before scaling.
+    hy1 = int((by + ROI_TOP) * LORES_TO_HIRES_Y) - BLUR_MARGIN_HIRES
+    # Always extend to bottom of saved frame.
+    hy2 = HIRES_CROP_BOTTOM
+    # If the blob touches the top of the ROI, extend to top of frame.
+    if by == 0:
+        hy1 = 0
+
+    H, W = hires_bgr.shape[:2]
+    hx1 = 0
+    hx2 = W
+    hy1 = max(0, hy1)
+
+    blurred = cv2.GaussianBlur(hires_bgr, (BLUR_KERNEL_SIZE, BLUR_KERNEL_SIZE), 0)
+    result  = blurred.copy()
+    # Restore unblurred vehicle region
+    result[hy1:hy2, hx1:hx2] = hires_bgr[hy1:hy2, hx1:hx2]
+    return result
+
+
+def _save_and_transfer(frames, event_count, rightward=True):
+    """
+    frames: list of (hires_bgr, stem, bbox_lores, meta) to save as JPEGs.
+    rightward: True if vehicle travelled left→right; used for leading-edge blur margin.
     Runs in a daemon thread.
     """
     if shm_free_mb() < SHM_MIN_MB:
@@ -246,21 +369,40 @@ def _save_and_transfer(frames, event_count):
                     shm_free_mb(), event_count)
         return
     SHM_BASE.mkdir(parents=True, exist_ok=True)
+
+    # Compute the union of all per-frame lores bboxes so every frame in this
+    # batch uses the same (largest) unblurred region — prevents the blur edge
+    # from cutting into the vehicle when one frame's bbox is tighter than another.
+    valid_bboxes = [b for _, _, b, _ in frames if b is not None]
+    if valid_bboxes:
+        union_bx  = min(b[0]        for b in valid_bboxes)
+        union_by  = min(b[1]        for b in valid_bboxes)
+        union_bx2 = max(b[0] + b[2] for b in valid_bboxes)
+        union_by2 = max(b[1] + b[3] for b in valid_bboxes)
+        union_bbox = (union_bx, union_by,
+                      union_bx2 - union_bx, union_by2 - union_by)
+    else:
+        union_bbox = None
+
     saved = []
-    for hires_bgr, stem in frames:
+    for hires_bgr, stem, _bbox_lores, meta in frames:
         fname = f"{stem}_{event_count}.jpg"
         path  = SHM_BASE / fname
-        cropped = hires_bgr[HIRES_CROP_TOP:HIRES_CROP_BOTTOM, :]
-        cv2.imwrite(str(path), cropped,
-                    [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        processed = blur_background(hires_bgr, union_bbox, rightward)
+        cropped   = processed[HIRES_CROP_TOP:HIRES_CROP_BOTTOM, :]
+        # Convert BGR→RGB for PIL, build EXIF, save as JPEG
+        rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb)
+        pil_img.save(str(path), format="JPEG", quality=JPEG_QUALITY,
+                     exif=_build_exif(meta) if meta else None)
         saved.append(fname)
         log.info("[save] event %d  → %s", event_count, fname)
     start_transfer()
 
 
-def start_save(frames, event_count):
+def start_save(frames, event_count, rightward=True):
     t = threading.Thread(target=_save_and_transfer,
-                         args=(frames, event_count), daemon=True)
+                         args=(frames, event_count, rightward), daemon=True)
     t.start()
 
 # ---------------------------------------------------------------------------
@@ -336,26 +478,164 @@ def find_vehicle_blob(mask):
 def estimate_center_frame(centroid_history):
     """
     Linear fit of centroid_x vs frame_index.
-    Returns (predicted_fi: float, used_interior: bool) or (None, False).
+    Returns (predicted_fi: float, used_interior: bool, fi_min: float, fi_max: float)
+    or (None, False, None, None).
+    fi_min/fi_max are the fi range of the subset used for fitting; the prediction
+    is only reliable within this range (extrapolation beyond it should be rejected).
     """
     interior = [(fi, cx) for fi, cx, full in centroid_history if full]
     subset   = interior if len(interior) >= 4 else \
                [(fi, cx) for fi, cx, _ in centroid_history] \
                if len(centroid_history) >= 4 else None
     if subset is None:
-        return None, False
+        return None, False, None, None
 
     used_interior = (subset is interior)
     idx    = np.array([s[0] for s in subset], dtype=np.float32)
     xs     = np.array([s[1] for s in subset], dtype=np.float32)
     coeffs = np.polyfit(idx, xs, 1)
     if abs(coeffs[0]) < 1e-3:
-        return None, False
-    return (FRAME_WIDTH / 2.0 - coeffs[1]) / coeffs[0], used_interior
+        return None, False, None, None
+    fi_min_fit = float(idx.min())
+    fi_max_fit = float(idx.max())
+    return (FRAME_WIDTH / 2.0 - coeffs[1]) / coeffs[0], used_interior, fi_min_fit, fi_max_fit
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
+def split_centroid_history(centroid_history):
+    """
+    Detect a tow-vehicle/trailer event by finding the first large backward
+    centroid step (against the direction of overall travel).  Returns
+    (phase1, phase2) where phase2 may be empty if no reversal is found.
+    Direction of travel is inferred from the sign of overall cx displacement.
+    """
+    if len(centroid_history) < 4:
+        return centroid_history, []
+
+    cx_vals = [cx for _, cx, _ in centroid_history]
+    direction = 1 if (cx_vals[-1] - cx_vals[0]) >= 0 else -1  # +1 rightward
+
+    for i in range(1, len(centroid_history)):
+        step = (cx_vals[i] - cx_vals[i - 1]) * direction  # negative = reversal
+        if step < -CENTROID_REVERSAL_THRESHOLD:
+            return centroid_history[:i], centroid_history[i:]
+
+    return centroid_history, []
+
+
+def pick_and_save(phase_history, vehicle_frame_indices, hires_buf,
+                  is_long, event_count, label, fi_bbox, rightward=True):
+    """
+    Given a centroid phase and the hires buffer, select two frames and save.
+    label is a short string for logging ('lead' or 'trailer').
+    fi_bbox maps fi → lores bbox for precise per-frame blur.
+    Returns True if save was initiated.
+    """
+    pred, used_int, fi_min_fit, fi_max_fit = estimate_center_frame(phase_history)
+    src = "interior" if used_int else "fallback"
+
+    phase_fis = [fi for fi, _, _ in phase_history]
+    fi_min = min(phase_fis) if phase_fis else None
+    fi_max = max(phase_fis) if phase_fis else None
+
+    if (pred is not None and fi_min_fit is not None
+            and fi_min_fit <= pred <= fi_max_fit):
+        chosen_fi = min(vehicle_frame_indices, key=lambda i: abs(i - pred),
+                        default=None)
+        chosen_by = f"linear fit ({src})"
+    else:
+        # Fall back to frame closest to centre of phase fi range
+        mid = (fi_min + fi_max) / 2.0 if fi_min is not None else None
+        chosen_fi = (min(vehicle_frame_indices, key=lambda i: abs(i - mid),
+                         default=None)
+                     if mid is not None else None)
+        chosen_by = "phase midpoint"
+
+    if chosen_fi is None or not hires_buf:
+        log.warning("  [%s] no frame available — skipping", label)
+        return False
+
+    lag = HIRES_LAG_FRAMES
+    adjusted_fi = chosen_fi + lag
+    to_save = _select_frames(hires_buf, adjusted_fi)
+    if to_save is None:
+        log.warning("  [%s] target fi=%d too far from buffer window — skipping",
+                    label, adjusted_fi)
+        return False
+    log.info("  [%s] saving fi=%s  (chosen_fi=%d  pred=%s  by=%s  lag=%d)",
+             label, [e[3] for e in to_save], chosen_fi,
+             f"{pred:.1f}" if pred is not None else "–", chosen_by, lag)
+    frames_to_save = [(bgr, stem, fi_bbox.get(entry_fi), meta) for bgr, stem, meta, entry_fi in to_save]
+    start_save(frames_to_save, event_count, rightward)
+    return True
+
+
+def save_long_vehicle_ends(vehicle_edge_frames, hires_buf, event_count, fi_bbox,
+                           rightward=True):
+    """
+    For a long vehicle, save two pairs of frames:
+      - front pair: nearest to when the leading edge first touched the far side
+        (front of vehicle about to exit)
+      - back pair: nearest to when the trailing edge last touched the near side
+        (rear of vehicle just after entry)
+
+    Direction is inferred from which side is touched first across the event.
+    HIRES_LAG_FRAMES is applied to both anchors.
+    fi_bbox maps fi → lores bbox for precise per-frame blur.
+    """
+    if not vehicle_edge_frames or not hires_buf:
+        log.warning("  [long] no edge frames or empty buffer — skipping")
+        return
+
+    # Infer direction: whichever side is touched in the first frame that touches
+    # either edge determines the near side (entry side).
+    near_left = None
+    for _, tl, tr in vehicle_edge_frames:
+        if tl or tr:
+            near_left = tl   # True = entered from left, False = entered from right
+            break
+    if near_left is None:
+        # No edge touches at all — fall back to first/last frames
+        front_fi = vehicle_edge_frames[-1][0]
+        back_fi  = vehicle_edge_frames[0][0]
+    else:
+        far_left = not near_left  # far side = where front exits
+
+        # Front anchor: first frame where leading edge touches the far side
+        front_fi = None
+        for fi, tl, tr in vehicle_edge_frames:
+            touches_far = tl if far_left else tr
+            if touches_far:
+                front_fi = fi
+                break
+
+        # Back anchor: last frame where trailing edge touches the near side
+        back_fi = None
+        for fi, tl, tr in reversed(vehicle_edge_frames):
+            touches_near = tl if near_left else tr
+            if touches_near:
+                back_fi = fi
+                break
+
+        if front_fi is None:
+            front_fi = vehicle_edge_frames[-1][0]
+            log.info("  [long] no far-edge touch found — using last frame as front anchor")
+        if back_fi is None:
+            back_fi = vehicle_edge_frames[0][0]
+            log.info("  [long] no near-edge touch found — using first frame as back anchor")
+
+    for label, anchor_fi in (("front", front_fi), ("back", back_fi)):
+        adjusted = anchor_fi + HIRES_LAG_FRAMES
+        to_save = _select_frames(hires_buf, adjusted)
+        if to_save is None:
+            log.warning("  [long %s] target fi=%d too far from buffer window — skipping",
+                        label, adjusted)
+            continue
+        log.info("  [long %s] saving fi=%s  (anchor_fi=%d  lag=%d)",
+                 label, [e[3] for e in to_save], anchor_fi, HIRES_LAG_FRAMES)
+        frames_to_save = [(bgr, stem, fi_bbox.get(entry_fi), meta)
+                          for bgr, stem, meta, entry_fi in to_save]
+        start_save(frames_to_save, event_count, rightward)
+
+
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
@@ -435,7 +715,7 @@ def main():
         cv2.MORPH_ELLIPSE, (MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE))
 
     # --- State ---------------------------------------------------------------
-    # Rolling buffer of (hires_bgr, stem, meta) — most recent HIRES_BUFFER_SIZE frames
+    # Rolling buffer of (hires_bgr, stem, meta, fi) — most recent HIRES_BUFFER_SIZE frames
     hires_buf: collections.deque = collections.deque(maxlen=HIRES_BUFFER_SIZE)
 
     # Metadata ring buffer for delay compensation
@@ -447,6 +727,8 @@ def main():
     event_frames          = 0      # frames since vehicle_active became True
     centroid_history      = []     # (fi, cx, fully_interior)
     vehicle_frame_indices = []     # fi of every VEHICLE-tagged frame
+    vehicle_edge_frames   = []     # (fi, touches_left, touches_right) for same frames
+    fi_bbox               = {}     # fi → (bx, by, bw, bh) lores bbox for event frames
     best_center_idx       = None   # global frame index
     best_center_dist      = float('inf')
     best_center_cx        = None
@@ -457,8 +739,8 @@ def main():
 
     # Load daily event counter — reset to 0 if date has changed since last run
     _saved_num, _saved_date = _load_event_num()
-    today = datetime.now().strftime('%Y%m%d')
-    event_count = _saved_num if _saved_date == today else 0
+    today = datetime.now().date()
+    event_count = _saved_num if _saved_date == today.strftime('%Y%m%d') else 0
     log.info("[event_num] starting at event %d for %s", event_count + 1, today)
 
     SHM_BASE.mkdir(parents=True, exist_ok=True)
@@ -476,6 +758,11 @@ def main():
         log.warning("[timing] SensorTimestamp unavailable — using datetime.now()")
 
     log.info("Warming up MOG2 background model (%d frames)…", MOG2_HISTORY)
+
+    # Target the first whole-minute boundary after startup for status logging
+    # and fi/day reset checks.  Thereafter advance by exactly 60 seconds each time.
+    _t = datetime.now()
+    _next_minute = _t.replace(second=0, microsecond=0) + timedelta(seconds=60)
 
     # --- Capture loop --------------------------------------------------------
     while running:
@@ -581,7 +868,14 @@ def main():
             consecutive += 1
             cx = blob['centroid_x']
 
+            # Clear centroid history at the start of each new detection run so
+            # stale entries from previous unconfirmed blobs don't corrupt the
+            # motion consistency calculation.
+            if consecutive == 1:
+                centroid_history = []
+
             bx, by, bw, bh = blob['bbox']
+            fi_bbox[fi] = (bx, by, bw, bh)
             edges = ('L' if blob['touches_left'] else '.') + \
                     ('R' if blob['touches_right'] else '.')
 
@@ -594,6 +888,7 @@ def main():
                 vehicle_active  = True
                 event_frames   += 1
                 vehicle_frame_indices.append(fi)
+                vehicle_edge_frames.append((fi, blob['touches_left'], blob['touches_right']))
                 max_blob_width  = max(max_blob_width, bw)
                 log.info("  fi=%d  cx=%.1f  w=%d  h=%d  ar=%.2f  edges=%s",
                          fi, cx, bw, bh, blob['aspect_ratio'], edges)
@@ -619,34 +914,78 @@ def main():
 
         if not blob and vehicle_active:
             # --- Vehicle event ended -----------------------------------------
-            pred, used_int = estimate_center_frame(centroid_history)
+            pred, used_int, fi_min_fit, fi_max_fit = estimate_center_frame(centroid_history)
             src = "interior" if used_int else "fallback"
 
-            # Select best frame index using linear fit if available and
-            # prediction falls within the observed vehicle frame range.
-            if (pred is not None and vehicle_frame_indices and
-                    min(vehicle_frame_indices) <= pred <= max(vehicle_frame_indices)):
+            # Accept the linear fit prediction only if it falls within the fi range
+            # of the frames used for fitting (not just any vehicle frame).
+            # Extrapolation beyond the fitted subset means the vehicle crossed centre
+            # before/after we had interior observations — use best_center_idx instead.
+            if (pred is not None and fi_min_fit is not None
+                    and fi_min_fit <= pred <= fi_max_fit):
                 chosen_fi = min(vehicle_frame_indices, key=lambda i: abs(i - pred))
                 chosen_by = f"linear fit ({src})"
             else:
                 chosen_fi = best_center_idx
                 chosen_by = "centroid proximity"
 
-            # Check centroid travel before logging or saving
-            cx_vals = [cx for _, cx, _ in centroid_history]
-            travel  = (max(cx_vals) - min(cx_vals)) if len(cx_vals) >= 2 else 0.0
+            # Check for tow-vehicle/trailer split before motion quality check,
+            # so a valid split can bypass the consistency gate.
+            phase1, phase2 = split_centroid_history(centroid_history)
 
-            log.info("VEHICLE END  event=%d  best_fi=%s  pred=%.1f  src=%s  by=%s  travel=%.1f",
+            def _phase_consistent(phase):
+                """Return True if this phase shows directed motion rather than jitter."""
+                cx_p = [cx for _, cx, _ in phase]
+                if len(cx_p) < 2:
+                    return False
+                steps    = [cx_p[i] - cx_p[i-1] for i in range(1, len(cx_p))]
+                path_len = sum(min(abs(s), MAX_STEP_FOR_CONSISTENCY) for s in steps)
+                net_disp = abs(cx_p[-1] - cx_p[0])
+                if path_len == 0:
+                    return False
+                consistency = net_disp / path_len
+                travel = max(cx_p) - min(cx_p)
+                return (consistency >= MIN_MOTION_CONSISTENCY
+                        and travel >= MIN_CENTROID_TRAVEL)
+
+            valid_split = (phase2
+                           and len(phase1) >= MIN_CONSECUTIVE_FRAMES
+                           and len(phase2) >= MIN_CONSECUTIVE_FRAMES
+                           and _phase_consistent(phase1)
+                           and _phase_consistent(phase2))
+
+            # Check motion quality — reject stationary blobs and random jitter.
+            # Skip for valid tow+trailer splits: the split itself is evidence of
+            # real directed motion in two phases.
+            cx_vals = [cx for _, cx, _ in centroid_history]
+            n_cx = len(cx_vals)
+            # Direction of travel for leading-edge blur margin
+            rightward = (cx_vals[-1] >= cx_vals[0]) if n_cx >= 2 else True
+            if n_cx >= 4:
+                steps      = [cx_vals[i] - cx_vals[i - 1] for i in range(1, n_cx)]
+                path_len   = sum(min(abs(s), MAX_STEP_FOR_CONSISTENCY) for s in steps)
+                net_disp   = abs(cx_vals[-1] - cx_vals[0])
+                consistency = (net_disp / path_len) if path_len > 0 else 0.0
+                travel      = max(cx_vals) - min(cx_vals)   # kept for log only
+                motion_ok   = valid_split or consistency >= MIN_MOTION_CONSISTENCY
+                motion_desc = (f"consistency={consistency:.2f}  "
+                               f"net={net_disp:.1f}  path={path_len:.1f}  "
+                               f"travel={travel:.1f}")
+            else:
+                travel      = (max(cx_vals) - min(cx_vals)) if n_cx >= 2 else 0.0
+                consistency = None
+                motion_ok   = valid_split or travel >= MIN_CENTROID_TRAVEL
+                motion_desc = f"travel={travel:.1f}  (short history, n={n_cx})"
+
+            log.info("VEHICLE END  event=%d  best_fi=%s  pred=%.1f  src=%s  by=%s  %s",
                      event_count + 1,
                      chosen_fi if chosen_fi is not None else '–',
                      pred if pred is not None else float('nan'),
-                     src, chosen_by, travel)
+                     src, chosen_by, motion_desc)
 
-            # Check centroid travel — stationary blobs are lighting artefacts, not vehicles.
-
-            if travel < MIN_CENTROID_TRAVEL:
-                log.warning("VEHICLE DISCARDED  travel=%.1f < %d — likely false trigger; "
-                            "resetting background model", travel, MIN_CENTROID_TRAVEL)
+            if not motion_ok:
+                log.warning("VEHICLE DISCARDED  %s — likely false trigger; "
+                            "resetting background model", motion_desc)
                 # Force MOG2 to rapidly re-learn the current frame as background
                 for _ in range(20):
                     fgbg.apply(roi, learningRate=0.5)
@@ -654,26 +993,79 @@ def main():
                 stuck_frames = 0
 
             elif chosen_fi is not None and hires_buf:
-                # Pick two buffer entries whose fi is closest to chosen_fi,
-                # adjusted for any hires/lores pipeline lag, with an extra
-                # offset for long vehicles so the front hasn't yet exited.
                 is_long = max_blob_width >= HIRES_LONG_VEHICLE_WIDTH
-                lag = HIRES_LAG_FRAMES + (HIRES_LAG_LONG_FRAMES if is_long else 0)
-                adjusted_fi = chosen_fi + lag
-                buf_list = list(hires_buf)  # each entry: (bgr, stem, meta, fi)
-                buf_list.sort(key=lambda e: abs(e[3] - adjusted_fi))
-                to_save  = buf_list[:2]
-                to_save.sort(key=lambda e: e[3])  # chronological order
-                log.info("  saving fi=%s  (chosen_fi=%d  lag=%d  long=%s  max_w=%d)",
-                         [e[3] for e in to_save], chosen_fi, lag,
-                         is_long, max_blob_width)
+
                 _, _last_date = _load_event_num()
                 if _last_date != datetime.now().strftime('%Y%m%d'):
                     event_count = 0
                 event_count += 1
                 _save_event_num(event_count)
-                frames_to_save = [(bgr, stem) for bgr, stem, _, _ in to_save]
-                start_save(frames_to_save, event_count)
+
+                if valid_split:
+                    # Two-phase event: save lead vehicle then trailer
+                    log.info("  [split] tow+trailer detected  "
+                             "(phase1=%d pts, phase2=%d pts)",
+                             len(phase1), len(phase2))
+                    pick_and_save(phase1, vehicle_frame_indices, hires_buf,
+                                  is_long, event_count, "lead", fi_bbox, rightward)
+                    pick_and_save(phase2, vehicle_frame_indices, hires_buf,
+                                  is_long, event_count, "trailer", fi_bbox, rightward)
+                elif is_long:
+                    # Long single vehicle: save front and back pairs
+                    save_long_vehicle_ends(vehicle_edge_frames, hires_buf,
+                                          event_count, fi_bbox, rightward)
+                else:
+                    # Normal single-vehicle save
+                    lag = HIRES_LAG_FRAMES
+                    adjusted_fi = chosen_fi + lag
+                    to_save = _select_frames(hires_buf, adjusted_fi)
+                    if to_save is None:
+                        log.warning("  target fi=%d too far from buffer window — skipping",
+                                    adjusted_fi)
+                    else:
+                        log.info("  saving fi=%s  (chosen_fi=%d  lag=%d  max_w=%d)",
+                                 [e[3] for e in to_save], chosen_fi, lag,
+                                 max_blob_width)
+                        frames_to_save = [(bgr, stem, fi_bbox.get(entry_fi), meta)
+                                          for bgr, stem, meta, entry_fi in to_save]
+                        start_save(frames_to_save, event_count, rightward)
+            elif motion_ok and vehicle_frame_indices and hires_buf:
+                # No fully-interior best frame (vehicle spanned the full width
+                # throughout).
+                # Reject if every confirmed frame touched both edges — this is
+                # a global illumination event (cloud shadow, sun glint) not a vehicle.
+                all_lr = all(tl and tr for _, tl, tr in vehicle_edge_frames)
+                if all_lr:
+                    log.warning("VEHICLE DISCARDED  all frames edges=LR — "
+                                "global illumination event, not a vehicle; "
+                                "resetting background model")
+                    for _ in range(20):
+                        fgbg.apply(roi, learningRate=0.5)
+                    ev_baseline = ev
+                    stuck_frames = 0
+                else:
+                    is_long = max_blob_width >= HIRES_LONG_VEHICLE_WIDTH
+                    _, _last_date = _load_event_num()
+                    if _last_date != datetime.now().strftime('%Y%m%d'):
+                        event_count = 0
+                    event_count += 1
+                    _save_event_num(event_count)
+                    if is_long:
+                        save_long_vehicle_ends(vehicle_edge_frames, hires_buf,
+                                              event_count, fi_bbox, rightward)
+                    else:
+                        # Save two frames nearest the fi midpoint
+                        mid_fi = (min(vehicle_frame_indices) + max(vehicle_frame_indices)) / 2.0
+                        to_save = _select_frames(hires_buf, mid_fi)
+                        if to_save is None:
+                            log.warning("  mid_fi=%.1f too far from buffer window — skipping",
+                                        mid_fi)
+                        else:
+                            log.info("  saving fi=%s  (mid_fi=%.1f  no interior frames)",
+                                     [e[3] for e in to_save], mid_fi)
+                            frames_to_save = [(bgr, stem, fi_bbox.get(entry_fi), meta)
+                                              for bgr, stem, meta, entry_fi in to_save]
+                            start_save(frames_to_save, event_count, rightward)
             else:
                 log.warning("VEHICLE END  no best frame available — skipping save")
 
@@ -683,6 +1075,8 @@ def main():
             event_frames          = 0
             centroid_history      = []
             vehicle_frame_indices = []
+            vehicle_edge_frames   = []
+            fi_bbox               = {}
             best_center_idx       = None
             best_center_dist      = float('inf')
             best_center_cx        = None
@@ -695,9 +1089,16 @@ def main():
             consecutive  = 0
             event_frames = 0
 
-        if frame_count % PRINT_INTERVAL == 0:
+        _now = datetime.now()
+        if _now >= _next_minute:
+            _next_minute += timedelta(seconds=60)
             log.info("frame=%d  events=%d  free_shm=%.0f MB  lr=%.4f",
                      frame_count, event_count, shm_free_mb(), lr)
+            _new_day = _now.date()
+            if _new_day != today:
+                today = _new_day
+                fi    = 0
+                log.info("[daily] new day %s — fi reset to 0", today)
 
         fi += 1
 
