@@ -12,6 +12,7 @@ Usage:
     python3 vehicle_detect.py [--tune FILE] [--shutter US] [--gain G] [--ev EV]
 """
 
+import dataclasses
 import math
 import argparse
 import collections
@@ -24,6 +25,8 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from flask import Flask, Response
+
 import cv2
 import numpy as np
 from PIL import Image
@@ -34,11 +37,16 @@ from picamera2 import Picamera2
 # Configuration
 # ---------------------------------------------------------------------------
 
-VERSION        = "1.058"
+VERSION        = "1.075" # SAVE_MASK constant, MIN_BLOB_BOTTOM_ROW filter
 FRAME_RATE     = 20.0
 LORES_SIZE     = (320, 240)
 HIRES_SIZE     = (1456, 1088)
 JPEG_QUALITY   = 95
+
+# Set True to save a lores MOG2 mask PNG alongside every captured JPEG.
+# Useful for algorithm development; disable for normal operation.
+#SAVE_MASK      = True
+SAVE_MASK      = False
 
 # Crop applied to saved full-res JPEGs (in 1456x1088 frame coordinates)
 HIRES_CROP_TOP    = 76
@@ -54,8 +62,16 @@ BLUR_TRAIL_MARGIN_HIRES = 100  # extra unblurred margin on the trailing edge (re
 LORES_TO_HIRES_X  = 1456 / 320
 LORES_TO_HIRES_Y  = 1088 / 240
 
+# Lores row range that corresponds to the hires JPEG crop (HIRES_CROP_TOP..HIRES_CROP_BOTTOM).
+# The mask PNG uses this vertical extent so its pixels map 1-to-1 with the saved JPEG
+# when both are scaled to the same display size.
+LORES_CROP_TOP    = round(HIRES_CROP_TOP    / LORES_TO_HIRES_Y)   # ~16
+LORES_CROP_BOTTOM = round(HIRES_CROP_BOTTOM / LORES_TO_HIRES_Y)   # ~183
+
 SHM_BASE       = Path("/dev/shm/burst")
 SHM_MIN_MB     = 100
+THUMB_PATH     = Path("/dev/shm/preview_thumb.jpg")  # latest event thumbnail
+LOG_DIR        = Path("/home/pi/CAMA")                # daily CSV event logs
 REMOTE_HOST    = "jbeale@jbeale-mini.local"
 REMOTE_DIR     = "/mnt/bluecherry/CAMA/"
 
@@ -88,17 +104,23 @@ ROI_TOP    = 60
 ROI_BOTTOM = 130
 
 MOG2_HISTORY        = 200
-MOG2_VAR_THRESHOLD  = 50
+MOG2_VAR_THRESHOLD  = 35 # was 50  6/2/2026
 MOG2_DETECT_SHADOWS = False
 
 MORPH_KERNEL_SIZE = 5
 
 MIN_BLOB_AREA       = 100 # catch smaller objects like bicyclists
-MIN_ASPECT_RATIO    = 0.8
-MIN_BLOB_WIDTH      = 50
+MIN_ASPECT_RATIO    = 0.4
+MIN_BLOB_WIDTH      = 20
 MIN_BLOB_HEIGHT     = 20   # lowered from 25 to avoid intermittent streak resets on dark cars
 MIN_HULL_FILL_RATIO = 0.44 # lowered from 0.45 to avoid boundary ties
-MIN_CENTROID_AREA   = 800 # was 3000, to see motorcycles and bicyclists
+
+# Minimum ROI-relative row that the blob's bounding box must reach.
+# Rejects background grass / illumination blobs that never touch the road zone.
+# Calibrated from observed data: grass-only false triggers bottom out ~row 35,
+# real vehicles reach ~row 75+.  Midpoint rounded down for margin.
+MIN_BLOB_BOTTOM_ROW = 50
+MIN_CENTROID_AREA   = 400 # was 3000, to see motorcycles and bicyclists
 
 # Minimum foreground pixel count to log when --verbose-fg is active.
 VERBOSE_FG_MIN_PIXELS = 150
@@ -365,10 +387,64 @@ def blur_background(hires_bgr, bbox_lores, rightward=True):
     return result
 
 
-def _save_and_transfer(frames, event_count, rightward=True):
+CSV_HEADER = "event,time,epoch,width(px),frames,type,velocity(px/fr)\n"
+
+
+def _append_csv_log(event_count, time_str, epoch, blob_width,
+                    event_frames, event_type, velocity, date_str):
+    """
+    Append one row to /home/pi/CAMA/YYYYMMDD_log.csv.
+    Creates the file (with header) if it does not yet exist.
+    date_str is 'YYYYMMDD', derived from the capture timestamp.
+    """
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / f"{date_str}_log.csv"
+    write_header = not log_path.exists()
+    vel_str = f"{velocity:.4f}" if velocity is not None else ""
+    row = (f"{event_count},{time_str},{epoch:.3f},"
+           f"{blob_width},{event_frames},{event_type},{vel_str}\n")
+    try:
+        with log_path.open('a') as f:
+            if write_header:
+                f.write(CSV_HEADER)
+            f.write(row)
+    except Exception as e:
+        log.warning("[csv] failed to write log: %s", e)
+
+
+def _build_mask_png(fg_mask_roi, lores_w=320):
+    """
+    Compose a mask PNG whose pixel grid corresponds to the saved hires JPEG.
+    The image is LORES_CROP_TOP..LORES_CROP_BOTTOM rows tall and lores_w wide.
+    The ROI band (ROI_TOP..ROI_BOTTOM) contains the MOG2 foreground mask (white=255);
+    rows outside the ROI band are black.
+    Returns a PNG-encoded bytes object, or None on failure.
+    """
+    h = LORES_CROP_BOTTOM - LORES_CROP_TOP
+    canvas = np.zeros((h, lores_w), dtype=np.uint8)
+    if fg_mask_roi is not None:
+        # ROI rows relative to the lores crop origin
+        roi_y1 = ROI_TOP    - LORES_CROP_TOP
+        roi_y2 = ROI_BOTTOM - LORES_CROP_TOP
+        roi_y1 = max(0, roi_y1)
+        roi_y2 = min(h, roi_y2)
+        mask_h = min(roi_y2 - roi_y1, fg_mask_roi.shape[0])
+        if mask_h > 0:
+            canvas[roi_y1:roi_y1 + mask_h, :fg_mask_roi.shape[1]] = \
+                fg_mask_roi[:mask_h, :]
+    ok, buf = cv2.imencode('.png', canvas)
+    return buf.tobytes() if ok else None
+
+
+def _save_and_transfer(frames, event_count, rightward=True, event_meta=None,
+                       _preview_state=None, fi_mask=None):
     """
     frames: list of (hires_bgr, stem, bbox_lores, meta) to save as JPEGs.
     rightward: True if vehicle travelled left→right; used for leading-edge blur margin.
+    event_meta: optional dict with keys time_str, blob_width, event_frames,
+                event_type, velocity — prepended to _preview_state.event_history.
+    fi_mask: optional dict mapping fi → fg_mask ndarray (ROI-relative, uint8).
+             When provided, a same-stem .png mask is written alongside each JPEG.
     Runs in a daemon thread.
     """
     if shm_free_mb() < SHM_MIN_MB:
@@ -392,6 +468,7 @@ def _save_and_transfer(frames, event_count, rightward=True):
         union_bbox = None
 
     saved = []
+    first_frame = True
     for hires_bgr, stem, _bbox_lores, meta in frames:
         fname = f"{stem}_{event_count}.jpg"
         path  = SHM_BASE / fname
@@ -402,15 +479,217 @@ def _save_and_transfer(frames, event_count, rightward=True):
         pil_img = Image.fromarray(rgb)
         pil_img.save(str(path), format="JPEG", quality=JPEG_QUALITY,
                      exif=_build_exif(meta) if meta else None)
+        # Save 50%-scaled thumbnail of the first frame for the web preview
+        if first_frame:
+            th, tw = cropped.shape[:2]
+            thumb = cv2.resize(cropped, (tw // 2, th // 2),
+                               interpolation=cv2.INTER_AREA)
+            thumb_rgb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
+            Image.fromarray(thumb_rgb).save(
+                str(THUMB_PATH), format="JPEG", quality=JPEG_QUALITY)
+            # Derive capture time from stem (YYYYMMDD_HHMMSS_mmm)
+            if event_meta is not None:
+                try:
+                    parts    = stem.split('_')
+                    date_str = parts[0]              # YYYYMMDD
+                    hms      = parts[1]              # HHMMSS
+                    ms_str   = parts[2]              # mmm
+                    time_str = f"{hms[0:2]}:{hms[2:4]}:{hms[4:6]}.{ms_str}"
+                    cap_dt   = datetime.strptime(
+                        f"{date_str}{hms}{ms_str}", "%Y%m%d%H%M%S%f")
+                    epoch    = cap_dt.timestamp()
+                except Exception:
+                    time_str = '??:??:??.???'
+                    epoch    = 0.0
+                    date_str = datetime.now().strftime('%Y%m%d')
+                _append_csv_log(
+                    event_count, time_str, epoch,
+                    event_meta['blob_width'], event_meta['event_frames'],
+                    event_meta['event_type'], event_meta.get('velocity'),
+                    date_str)
+                if _preview_state is not None:
+                    info = dict(event_meta)
+                    info['time_str']    = time_str
+                    info['event_count'] = event_count
+                    with _preview_state.lock:
+                        _preview_state.event_history = (
+                            [info] + _preview_state.event_history)[:5]
+            first_frame = False
         saved.append(fname)
         log.info("[save] event %d  → %s", event_count, fname)
+
+        # Write companion mask PNG if enabled and fg_mask data is available for this frame
+        if SAVE_MASK and fi_mask is not None:
+            mask_roi  = fi_mask.get(stem)
+            png_bytes = _build_mask_png(mask_roi)
+            if png_bytes:
+                mask_fname = f"{stem}_{event_count}_mask.png"
+                mask_path  = SHM_BASE / mask_fname
+                mask_path.write_bytes(png_bytes)
+                log.info("[save] event %d  → %s", event_count, mask_fname)
+
     start_transfer()
 
 
-def start_save(frames, event_count, rightward=True):
+def start_save(frames, event_count, rightward=True, event_meta=None,
+               preview_state=None, fi_mask=None):
     t = threading.Thread(target=_save_and_transfer,
-                         args=(frames, event_count, rightward), daemon=True)
+                         args=(frames, event_count, rightward),
+                         kwargs={'event_meta': event_meta,
+                                 '_preview_state': preview_state,
+                                 'fi_mask': fi_mask},
+                         daemon=True)
     t.start()
+
+# ---------------------------------------------------------------------------
+# Live preview server  (Flask MJPEG, port 8080)
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass
+class PreviewState:
+    lock:          threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    jpeg:          bytes | None   = None   # latest encoded frame
+    blob:          dict | None    = None   # latest blob dict (or None between events)
+    fg_mask:       object         = None   # latest fg_mask ndarray (ROI coords)
+    event_history: list           = dataclasses.field(default_factory=list)  # up to 5 recent events, newest first
+
+
+_OVERLAY_COLOR = (0, 200, 0)    # green tint for motion mask pixels  (BGR)
+_OVERLAY_ALPHA = 0.45
+_BBOX_COLOR    = (0, 220, 255)  # cyan-yellow box                     (BGR)
+_BBOX_THICK    = 2
+_PREVIEW_SCALE = 1              # upscale factor (1 = native lores resolution)
+_PREVIEW_PORT  = 8080
+
+
+def _compose_preview(color_frame, fg_mask, blob) -> bytes:
+    """
+    Build the annotated preview JPEG:
+      - full lores color frame, 2x upscaled (nearest neighbour)
+      - green tint where fg_mask is nonzero (ROI band only)
+      - bounding box if blob is not None
+    Returns JPEG bytes.
+    """
+    vis = color_frame.copy()
+    h, w = vis.shape[:2]
+
+    # Green overlay on foreground pixels within the ROI band
+    if fg_mask is not None:
+        overlay  = vis.copy()
+        roi_view = overlay[ROI_TOP:ROI_BOTTOM, :]
+        roi_view[fg_mask > 0] = _OVERLAY_COLOR
+        cv2.addWeighted(overlay, _OVERLAY_ALPHA, vis, 1.0 - _OVERLAY_ALPHA, 0, vis)
+
+    # Bounding box — bbox coords are ROI-relative; restore full-frame y
+    if blob is not None:
+        bx, by, bw, bh = blob['bbox']
+        x1 = bx
+        y1 = by + ROI_TOP
+        cv2.rectangle(vis, (x1, y1), (x1 + bw, y1 + bh), _BBOX_COLOR, _BBOX_THICK)
+
+    # 2x nearest-neighbour upscale
+    vis = cv2.resize(vis, (w * _PREVIEW_SCALE, h * _PREVIEW_SCALE),
+                     interpolation=cv2.INTER_NEAREST)
+
+    ok, buf = cv2.imencode('.jpg', vis, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    return buf.tobytes() if ok else b''
+
+
+def _preview_writer(state: PreviewState, color_frame, fg_mask):
+    """Called from the main loop at ~1 fps. Reads current blob from state."""
+    with state.lock:
+        blob = state.blob
+    jpeg = _compose_preview(color_frame, fg_mask, blob)
+    with state.lock:
+        state.jpeg = jpeg
+
+
+def _flask_thread(state: PreviewState, port: int):
+    app = Flask(__name__)
+    logging.getLogger('werkzeug').setLevel(logging.ERROR)  # silence per-request noise
+
+    @app.route('/')
+    def index():
+        return Response(
+            '<!doctype html>'
+            '<html><head><title>CAMA preview</title>'
+            '<style>'
+            'body{margin:0;background:#111;display:flex;flex-direction:column;'
+            'align-items:center;justify-content:center;min-height:100vh;gap:12px}'
+            'img{image-rendering:pixelated;max-width:100%}'
+            '#thumb{opacity:0.85}'
+            '#info{color:#ccc;font-family:monospace;font-size:14px;'
+            'background:#1e1e1e;padding:8px 16px;border-radius:4px;'
+            'white-space:pre;letter-spacing:0.03em}'
+            '</style></head>'
+            '<body>'
+            '<img src="/stream">'
+            '<div id="info">—</div>'
+            '<img id="thumb" src="/thumb">'
+            '<script>'
+            'function refreshInfo(){'
+            '  fetch("/info").then(r=>r.json()).then(arr=>{'
+            '    if(!arr.length){return;}'
+            '    var lines=arr.slice().reverse().map(function(d){'
+            '      return "#"+d.event_count'
+            '        +"  "+d.time_str'
+            '        +"  w="+d.blob_width+"px"'
+            '        +"  frames="+String(d.event_frames).padStart(2,"0")'
+            '        +"  type="+d.event_type'
+            '        +"  vel="+(d.velocity!==null?(d.velocity>=0?"+":"")+d.velocity.toFixed(2):"?")+"px/fr";'
+            '    });'
+            '    document.getElementById("info").textContent=lines.join("\\n");'
+            '  }).catch(()=>{});'
+            '}'
+            'setInterval(function(){'
+            '  var t=document.getElementById("thumb");'
+            '  t.src="/thumb?t="+Date.now();'
+            '  refreshInfo();'
+            '},5000);'
+            'refreshInfo();'
+            '</script>'
+            '</body></html>',
+            mimetype='text/html')
+
+    def _gen():
+        while True:
+            with state.lock:
+                frame = state.jpeg
+            if frame:
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                       + frame + b'\r\n')
+            time.sleep(0.05)   # poll at 20 Hz; image itself updates at ~2 fps
+
+    @app.route('/stream')
+    def stream():
+        return Response(_gen(),
+                        mimetype='multipart/x-mixed-replace; boundary=frame')
+
+    @app.route('/thumb')
+    def thumb():
+        if THUMB_PATH.exists():
+            return Response(THUMB_PATH.read_bytes(), mimetype='image/jpeg')
+        # Return a 1x1 transparent GIF as placeholder until first event
+        return Response(
+            b'GIF89a\x01\x00\x01\x00\x00\xff\x00,\x00\x00\x00\x00'
+            b'\x01\x00\x01\x00\x00\x02\x00;',
+            mimetype='image/gif')
+
+    @app.route('/info')
+    def info():
+        import json as _json
+        with state.lock:
+            history = list(state.event_history)
+        return Response(_json.dumps(history), mimetype='application/json')
+
+    app.run(host='0.0.0.0', port=port, threaded=True, use_reloader=False)
+
+
+def start_preview_server(state: PreviewState, port: int = _PREVIEW_PORT):
+    t = threading.Thread(target=_flask_thread, args=(state, port), daemon=True)
+    t.start()
+    log.info("[preview] serving on http://0.0.0.0:%d/", port)
+
 
 # ---------------------------------------------------------------------------
 # Detection helpers
@@ -464,6 +743,9 @@ def find_vehicle_blob(mask):
     if hh     < MIN_BLOB_HEIGHT:     fail.append(f'h={hh}<{MIN_BLOB_HEIGHT}')
     if aspect < MIN_ASPECT_RATIO:    fail.append(f'ar={aspect:.2f}<{MIN_ASPECT_RATIO}')
     if fill   < MIN_HULL_FILL_RATIO: fail.append(f'fill={fill:.2f}<{MIN_HULL_FILL_RATIO}')
+    blob_bottom = hy + hh             # ROI-relative bottom edge of bounding box
+    if blob_bottom < MIN_BLOB_BOTTOM_ROW:
+        fail.append(f'bottom={blob_bottom}<{MIN_BLOB_BOTTOM_ROW}(grass/sky blob)')
     if fail:
         reason = f'area={area:.0f} w={hw} h={hh} ar={aspect:.2f} fill={fill:.2f} cx={cx:.0f} FAIL({" ".join(fail)})'
         return None, reason
@@ -524,7 +806,8 @@ def split_centroid_history(centroid_history):
 
 
 def pick_and_save(phase_history, vehicle_frame_indices, hires_buf,
-                  is_long, event_count, label, fi_bbox, rightward=True):
+                  is_long, event_count, label, fi_bbox, rightward=True,
+                  event_meta=None, preview_state=None, fi_mask=None):
     """
     Given a centroid phase and the hires buffer, select two frames and save.
     label is a short string for logging ('lead' or 'trailer').
@@ -566,12 +849,15 @@ def pick_and_save(phase_history, vehicle_frame_indices, hires_buf,
              label, [e[3] for e in to_save], chosen_fi,
              f"{pred:.1f}" if pred is not None else "–", chosen_by, lag)
     frames_to_save = [(bgr, stem, fi_bbox.get(entry_fi), meta) for bgr, stem, meta, entry_fi in to_save]
-    start_save(frames_to_save, event_count, rightward)
+    start_save(frames_to_save, event_count, rightward,
+               event_meta=event_meta, preview_state=preview_state,
+               fi_mask=fi_mask)
     return True
 
 
 def save_long_vehicle_ends(vehicle_edge_frames, hires_buf, event_count, fi_bbox,
-                           rightward=True):
+                           rightward=True, event_meta=None, preview_state=None,
+                           fi_mask=None):
     """
     For a long vehicle, save two pairs of frames:
       - front pair: nearest to when the leading edge first touched the far side
@@ -635,7 +921,9 @@ def save_long_vehicle_ends(vehicle_edge_frames, hires_buf, event_count, fi_bbox,
                  label, [e[3] for e in to_save], anchor_fi, HIRES_LAG_FRAMES)
         frames_to_save = [(bgr, stem, fi_bbox.get(entry_fi), meta)
                           for bgr, stem, meta, entry_fi in to_save]
-        start_save(frames_to_save, event_count, rightward)
+        start_save(frames_to_save, event_count, rightward,
+                   event_meta=event_meta, preview_state=preview_state,
+                   fi_mask=fi_mask)
 
 
 
@@ -731,6 +1019,7 @@ def main():
     vehicle_frame_indices = []     # fi of every VEHICLE-tagged frame
     vehicle_edge_frames   = []     # (fi, touches_left, touches_right) for same frames
     fi_bbox               = {}     # fi → (bx, by, bw, bh) lores bbox for event frames
+    fi_mask               = {}     # stem → fg_mask ndarray (ROI-relative) for event frames
     best_center_idx       = None   # global frame index
     best_center_dist      = float('inf')
     best_center_cx        = None
@@ -746,6 +1035,10 @@ def main():
     log.info("[event_num] starting at event %d for %s", event_count + 1, today)
 
     SHM_BASE.mkdir(parents=True, exist_ok=True)
+
+    # --- Preview server ------------------------------------------------------
+    preview_state = PreviewState()
+    start_preview_server(preview_state)
 
     # --- NTP + sensor anchor -------------------------------------------------
     picam2.start()
@@ -858,12 +1151,16 @@ def main():
         # Blob detection
         if lockout_remaining > 0:
             lockout_remaining -= 1
-            blob        = None
+            blob          = None
             reject_reason = None
+            with preview_state.lock:
+                preview_state.blob = None
         else:
             blob, reject_reason = find_vehicle_blob(fg_mask)
             if reject_reason:
                 log.info("  fi=%d  REJECTED  %s", fi, reject_reason)
+            with preview_state.lock:
+                preview_state.blob = blob
 
         # --- Event logic -----------------------------------------------------
         if blob:
@@ -878,6 +1175,7 @@ def main():
 
             bx, by, bw, bh = blob['bbox']
             fi_bbox[fi] = (bx, by, bw, bh)
+            fi_mask[stem] = fg_mask.copy() if SAVE_MASK else None
             edges = ('L' if blob['touches_left'] else '.') + \
                     ('R' if blob['touches_right'] else '.')
 
@@ -948,16 +1246,34 @@ def main():
                 return (consistency >= MIN_MOTION_CONSISTENCY
                         and travel >= MIN_CENTROID_TRAVEL)
 
+            p1_consistent = _phase_consistent(phase1)
+            p2_consistent = phase2 and _phase_consistent(phase2)
+
             valid_split = (phase2
                            and len(phase1) >= MIN_CONSECUTIVE_FRAMES
                            and len(phase2) >= MIN_CONSECUTIVE_FRAMES
-                           and _phase_consistent(phase1)
-                           and _phase_consistent(phase2))
+                           and p1_consistent
+                           and p2_consistent)
+
+            # phase1_only: phase1 is a valid directed vehicle but phase2 is an
+            # AGC artifact or stationary background patch (fails consistency).
+            # Re-evaluate all motion quality checks using phase1 points only so
+            # the artifact tail cannot poison the stationarity or consistency tests.
+            phase1_only = (phase2
+                           and len(phase1) >= MIN_CONSECUTIVE_FRAMES
+                           and p1_consistent
+                           and not p2_consistent)
+
+            # Use phase1 points for motion quality when phase1_only, else full history.
+            eval_history = phase1 if phase1_only else centroid_history
+            if phase1_only:
+                log.info("  [phase1_only] phase2 failed consistency — "
+                         "evaluating motion on phase1 (%d pts) only", len(phase1))
 
             # Check motion quality — reject stationary blobs and random jitter.
-            # Skip for valid tow+trailer splits: the split itself is evidence of
-            # real directed motion in two phases.
-            cx_vals = [cx for _, cx, _ in centroid_history]
+            # Skip for valid tow+trailer splits or phase1_only saves: phase
+            # consistency is already confirmed above.
+            cx_vals = [cx for _, cx, _ in eval_history]
             n_cx = len(cx_vals)
             # Direction of travel for leading-edge blur margin
             rightward = (cx_vals[-1] >= cx_vals[0]) if n_cx >= 2 else True
@@ -974,7 +1290,7 @@ def main():
             STATIONARY_TAIL_N = 10
             is_long_vehicle = max_blob_width >= HIRES_LONG_VEHICLE_WIDTH
             confirmed_fi_set = set(vehicle_frame_indices)
-            confirmed_cx = [cx for fi, cx, _ in centroid_history if fi in confirmed_fi_set]
+            confirmed_cx = [cx for fi, cx, _ in eval_history if fi in confirmed_fi_set]
             if (MIN_CONFIRMED_CX_STD > 0
                     and not is_long_vehicle
                     and len(confirmed_cx) >= STATIONARY_TAIL_N):
@@ -991,7 +1307,8 @@ def main():
                 net_disp   = abs(cx_vals[-1] - cx_vals[0])
                 consistency = (net_disp / path_len) if path_len > 0 else 0.0
                 travel      = max(cx_vals) - min(cx_vals)   # kept for log only
-                motion_ok   = (not stationary) and (valid_split or consistency >= MIN_MOTION_CONSISTENCY)
+                motion_ok   = (not stationary) and (valid_split or phase1_only
+                               or consistency >= MIN_MOTION_CONSISTENCY)
                 motion_desc = (f"consistency={consistency:.2f}  "
                                f"net={net_disp:.1f}  path={path_len:.1f}  "
                                f"travel={travel:.1f}"
@@ -999,7 +1316,8 @@ def main():
             else:
                 travel      = (max(cx_vals) - min(cx_vals)) if n_cx >= 2 else 0.0
                 consistency = None
-                motion_ok   = (not stationary) and (valid_split or travel >= MIN_CENTROID_TRAVEL)
+                motion_ok   = (not stationary) and (valid_split or phase1_only
+                               or travel >= MIN_CENTROID_TRAVEL)
                 motion_desc = (f"travel={travel:.1f}  (short history, n={n_cx})"
                                + (f"  cx_std={confirmed_cx_std:.1f}" if confirmed_cx_std is not None else ""))
 
@@ -1028,19 +1346,53 @@ def main():
                 event_count += 1
                 _save_event_num(event_count)
 
+                # Compute signed velocity (lores px/frame) from eval_history
+                # (phase1 only when phase1_only, else full centroid history).
+                _velocity = None
+                if len(eval_history) >= 4:
+                    _cx_idx = np.array([f for f, _, _ in eval_history], dtype=np.float32)
+                    _cx_val = np.array([c for _, c, _ in eval_history], dtype=np.float32)
+                    _vel_coeffs = np.polyfit(_cx_idx, _cx_val, 1)
+                    _velocity = float(_vel_coeffs[0])
+
+                _event_type = ('split' if valid_split
+                               else 'phase1' if phase1_only
+                               else 'long' if is_long
+                               else 'normal')
+                _event_meta = {
+                    'blob_width':   max_blob_width,
+                    'event_frames': len(vehicle_frame_indices),
+                    'event_type':   _event_type,
+                    'velocity':     _velocity,
+                }
+
                 if valid_split:
                     # Two-phase event: save lead vehicle then trailer
                     log.info("  [split] tow+trailer detected  "
                              "(phase1=%d pts, phase2=%d pts)",
                              len(phase1), len(phase2))
                     pick_and_save(phase1, vehicle_frame_indices, hires_buf,
-                                  is_long, event_count, "lead", fi_bbox, rightward)
+                                  is_long, event_count, "lead", fi_bbox, rightward,
+                                  event_meta=_event_meta, preview_state=preview_state,
+                                  fi_mask=fi_mask)
                     pick_and_save(phase2, vehicle_frame_indices, hires_buf,
-                                  is_long, event_count, "trailer", fi_bbox, rightward)
+                                  is_long, event_count, "trailer", fi_bbox, rightward,
+                                  fi_mask=fi_mask)
+                elif phase1_only:
+                    # Vehicle followed by AGC artifact: save using phase1 only
+                    log.info("  [phase1_only] saving phase1 as single vehicle "
+                             "(%d pts)", len(phase1))
+                    pick_and_save(phase1, vehicle_frame_indices, hires_buf,
+                                  is_long, event_count, "phase1", fi_bbox, rightward,
+                                  event_meta=_event_meta, preview_state=preview_state,
+                                  fi_mask=fi_mask)
                 elif is_long:
                     # Long single vehicle: save front and back pairs
                     save_long_vehicle_ends(vehicle_edge_frames, hires_buf,
-                                          event_count, fi_bbox, rightward)
+                                          event_count, fi_bbox, rightward,
+                                          event_meta=_event_meta,
+                                          preview_state=preview_state,
+                                          fi_mask=fi_mask)
                 else:
                     # Normal single-vehicle save
                     lag = HIRES_LAG_FRAMES
@@ -1055,7 +1407,10 @@ def main():
                                  max_blob_width)
                         frames_to_save = [(bgr, stem, fi_bbox.get(entry_fi), meta)
                                           for bgr, stem, meta, entry_fi in to_save]
-                        start_save(frames_to_save, event_count, rightward)
+                        start_save(frames_to_save, event_count, rightward,
+                                   event_meta=_event_meta,
+                                   preview_state=preview_state,
+                                   fi_mask=fi_mask)
             elif motion_ok and vehicle_frame_indices and hires_buf:
                 # No fully-interior best frame (vehicle spanned the full width
                 # throughout).
@@ -1077,9 +1432,28 @@ def main():
                         event_count = 0
                     event_count += 1
                     _save_event_num(event_count)
+
+                    _velocity = None
+                    if len(eval_history) >= 4:
+                        _cx_idx = np.array([f for f, _, _ in eval_history], dtype=np.float32)
+                        _cx_val = np.array([c for _, c, _ in eval_history], dtype=np.float32)
+                        _vel_coeffs = np.polyfit(_cx_idx, _cx_val, 1)
+                        _velocity = float(_vel_coeffs[0])
+
+                    _event_type = 'long' if is_long else 'normal'
+                    _event_meta = {
+                        'blob_width':   max_blob_width,
+                        'event_frames': len(vehicle_frame_indices),
+                        'event_type':   _event_type,
+                        'velocity':     _velocity,
+                    }
+
                     if is_long:
                         save_long_vehicle_ends(vehicle_edge_frames, hires_buf,
-                                              event_count, fi_bbox, rightward)
+                                              event_count, fi_bbox, rightward,
+                                              event_meta=_event_meta,
+                                              preview_state=preview_state,
+                                              fi_mask=fi_mask)
                     else:
                         # Save two frames nearest the fi midpoint
                         mid_fi = (min(vehicle_frame_indices) + max(vehicle_frame_indices)) / 2.0
@@ -1092,7 +1466,10 @@ def main():
                                      [e[3] for e in to_save], mid_fi)
                             frames_to_save = [(bgr, stem, fi_bbox.get(entry_fi), meta)
                                               for bgr, stem, meta, entry_fi in to_save]
-                            start_save(frames_to_save, event_count, rightward)
+                            start_save(frames_to_save, event_count, rightward,
+                                       event_meta=_event_meta,
+                                       preview_state=preview_state,
+                                       fi_mask=fi_mask)
             else:
                 log.warning("VEHICLE END  no best frame available — skipping save")
 
@@ -1104,6 +1481,7 @@ def main():
             vehicle_frame_indices = []
             vehicle_edge_frames   = []
             fi_bbox               = {}
+            fi_mask               = {}
             best_center_idx       = None
             best_center_dist      = float('inf')
             best_center_cx        = None
@@ -1126,6 +1504,10 @@ def main():
                 today = _new_day
                 fi    = 0
                 log.info("[daily] new day %s — fi reset to 0", today)
+
+        # Write preview frame at ~4 fps
+        if fi % int(FRAME_RATE / 4) == 0:
+            _preview_writer(preview_state, color, fg_mask)
 
         fi += 1
 
