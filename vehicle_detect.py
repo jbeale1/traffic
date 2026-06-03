@@ -37,7 +37,7 @@ from picamera2 import Picamera2
 # Configuration
 # ---------------------------------------------------------------------------
 
-VERSION        = "1.077" # lux and shutter(us) columns added to CSV log
+VERSION        = "1.084" # avoid classifying white cars as long vehicles
 FRAME_RATE     = 20.0
 LORES_SIZE     = (320, 240)
 HIRES_SIZE     = (1456, 1088)
@@ -118,8 +118,8 @@ MIN_HULL_FILL_RATIO = 0.44 # lowered from 0.45 to avoid boundary ties
 # Minimum ROI-relative row that the blob's bounding box must reach.
 # Rejects background grass / illumination blobs that never touch the road zone.
 # Calibrated from observed data: grass-only false triggers bottom out ~row 35,
-# real vehicles reach ~row 75+.  Midpoint rounded down for margin.
-MIN_BLOB_BOTTOM_ROW = 50
+# real vehicles reach ~row 75+.
+MIN_BLOB_BOTTOM_ROW = 60  # was 50
 MIN_CENTROID_AREA   = 400 # was 3000, to see motorcycles and bicyclists
 
 # Minimum foreground pixel count to log when --verbose-fg is active.
@@ -171,6 +171,16 @@ LR_BOOST2_AFTER     = 600   # frames (~30 seconds at 20fps)
 # Correction factor must be within this fraction of 1.0 for MOG2 to resume
 # learning. Widened from 0.02 to allow adaptation after sustained exposure shifts.
 AGC_SETTLED_THRESHOLD = 0.15
+
+# Fractional EV deviation from the pre-event baseline above which a centroid
+# history entry is considered EV-suspect (AGC shifted significantly from the
+# background the MOG2 model was built on).  Suspect frames are trimmed from the
+# tail of centroid_history before motion quality evaluation.
+# 0.15 = 15% EV change, roughly half a stop.  Set to 0 to disable trimming.
+EV_SUSPECT_THRESHOLD = 0.15
+
+# Number of pre-event frames used to compute the EV baseline for suspect detection.
+EV_PRE_EVENT_WINDOW = 30   # ~1.5 s at 20 fps
 
 EDGE_MARGIN  = 3
 FRAME_WIDTH  = LORES_SIZE[0]
@@ -293,12 +303,17 @@ def start_transfer():
 # Save thread
 # ---------------------------------------------------------------------------
 
-def _build_exif(meta: dict):
+def _build_exif(meta: dict, bbox_lores=None):
     """Build a Pillow ExifData object from libcamera metadata.
 
-    Tags that are SRATIONAL (signed rational) -- ShutterSpeedValue, BrightnessValue,
-    CameraTemperature -- must go into the Exif sub-IFD (0x8769) via get_ifd(), not the
-    top-level dict, because Pillow encodes top-level rationals as unsigned RATIONAL.
+    Tags that are SRATIONAL (signed rational) -- ShutterSpeedValue, BrightnessValue --
+    must go into the Exif sub-IFD (0x8769) via get_ifd(), not the top-level dict,
+    because Pillow encodes top-level rationals as unsigned RATIONAL.
+
+    bbox_lores: optional (bx, by, bw, bh) in lores coordinates (ROI-relative y).
+    Converted to hires-cropped pixel coordinates and stored in ImageDescription as
+    BBox=x1,y1,x2,y2 where (x1,y1) is top-left and (x2,y2) is bottom-right of the
+    vehicle in the saved JPEG's coordinate space.
     """
     exif = Image.Exif()
     ifd  = exif.get_ifd(0x8769)   # Exif sub-IFD
@@ -323,17 +338,20 @@ def _build_exif(meta: dict):
     if gain is not None:
         ifd[0x8827] = int(round(gain * 100))
 
-    # SensorTemperature -> CameraTemperature (tag 0x9400, Exif IFD), SRATIONAL degC x10
-    temp = meta.get("SensorTemperature")
-    if temp is not None:
-        ifd[0x9400] = (int(round(temp * 10)), 10)
-
-    # ImageDescription: human-readable lux + temperature for viewers that show IFD0 only
+    # ImageDescription: human-readable lux and bounding box for viewers that show IFD0 only.
+    # BBox is in the saved JPEG's coordinate space (hires, vertically cropped by HIRES_CROP_TOP).
     desc_parts = []
     if lux is not None:
         desc_parts.append(f"Lux={lux:.1f}")
-    if temp is not None:
-        desc_parts.append(f"SensorTemp={temp:.1f}C")
+    if bbox_lores is not None:
+        bx, by, bw, bh = bbox_lores
+        hx1 = int(bx * LORES_TO_HIRES_X)
+        hx2 = int((bx + bw) * LORES_TO_HIRES_X)
+        hy1 = int((by + ROI_TOP) * LORES_TO_HIRES_Y) - HIRES_CROP_TOP
+        hy2 = int((by + bh + ROI_TOP) * LORES_TO_HIRES_Y) - HIRES_CROP_TOP
+        hx1 = max(0, hx1);  hx2 = min(HIRES_SIZE[0], hx2)
+        hy1 = max(0, hy1);  hy2 = min(HIRES_CROP_BOTTOM - HIRES_CROP_TOP, hy2)
+        desc_parts.append(f"BBox={hx1},{hy1},{hx2},{hy2}")
     if desc_parts:
         exif[0x010E] = " ".join(desc_parts)   # ImageDescription, top-level IFD0
 
@@ -474,16 +492,17 @@ def _save_and_transfer(frames, event_count, rightward=True, event_meta=None,
 
     saved = []
     first_frame = True
-    for hires_bgr, stem, _bbox_lores, meta in frames:
+    for hires_bgr, stem, bbox_lores, meta in frames:
         fname = f"{stem}_{event_count}.jpg"
         path  = SHM_BASE / fname
         processed = blur_background(hires_bgr, union_bbox, rightward)
         cropped   = processed[HIRES_CROP_TOP:HIRES_CROP_BOTTOM, :]
-        # Convert BGR→RGB for PIL, build EXIF, save as JPEG
+        # Convert BGR→RGB for PIL, build EXIF, save as JPEG.
+        # Blur uses union_bbox (covers both frames); EXIF embeds per-frame bbox_lores.
         rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(rgb)
         pil_img.save(str(path), format="JPEG", quality=JPEG_QUALITY,
-                     exif=_build_exif(meta) if meta else None)
+                     exif=_build_exif(meta, bbox_lores) if meta else None)
         # Save 50%-scaled thumbnail of the first frame for the web preview
         if first_frame:
             th, tw = cropped.shape[:2]
@@ -775,10 +794,11 @@ def estimate_center_frame(centroid_history):
     """
     Linear fit of centroid_x vs frame_index.
     Returns (predicted_fi: float, used_interior: bool) or (None, False).
+    centroid_history entries are (fi, cx, fully_interior, ev) 4-tuples.
     """
-    interior = [(fi, cx) for fi, cx, full in centroid_history if full]
+    interior = [(fi, cx) for fi, cx, full, *_ in centroid_history if full]
     subset   = interior if len(interior) >= 4 else \
-               [(fi, cx) for fi, cx, _ in centroid_history] \
+               [(fi, cx) for fi, cx, *_ in centroid_history] \
                if len(centroid_history) >= 4 else None
     if subset is None:
         return None, False
@@ -796,13 +816,18 @@ def split_centroid_history(centroid_history):
     Detect a tow-vehicle/trailer event by finding the first large backward
     centroid step (against the direction of overall travel).  Returns
     (phase1, phase2) where phase2 may be empty if no reversal is found.
-    Direction of travel is inferred from the sign of overall cx displacement.
+    Direction of travel is inferred from the median of per-frame cx differences,
+    which is robust against a single AGC artifact at the tail that would
+    otherwise flip the first-vs-last direction estimate.
     """
     if len(centroid_history) < 4:
         return centroid_history, []
 
-    cx_vals = [cx for _, cx, _ in centroid_history]
-    direction = 1 if (cx_vals[-1] - cx_vals[0]) >= 0 else -1  # +1 rightward
+    cx_vals = [cx for _, cx, *_ in centroid_history]
+    # Use median of per-frame steps to determine direction; a single outlier
+    # frame (e.g. AGC transient at the tail) cannot flip the sign this way.
+    steps_all = [cx_vals[i] - cx_vals[i - 1] for i in range(1, len(cx_vals))]
+    direction = 1 if float(np.median(steps_all)) >= 0 else -1  # +1 rightward
 
     for i in range(1, len(centroid_history)):
         step = (cx_vals[i] - cx_vals[i - 1]) * direction  # negative = reversal
@@ -824,7 +849,7 @@ def pick_and_save(phase_history, vehicle_frame_indices, hires_buf,
     pred, used_int = estimate_center_frame(phase_history)
     src = "interior" if used_int else "fallback"
 
-    phase_fis = [fi for fi, _, _ in phase_history]
+    phase_fis = [fi for fi, *_ in phase_history]
     fi_min = min(phase_fis) if phase_fis else None
     fi_max = max(phase_fis) if phase_fis else None
 
@@ -852,9 +877,15 @@ def pick_and_save(phase_history, vehicle_frame_indices, hires_buf,
         log.warning("  [%s] target fi=%d too far from buffer window — skipping",
                     label, adjusted_fi)
         return False
-    log.info("  [%s] saving fi=%s  (chosen_fi=%d  pred=%s  by=%s  lag=%d)",
+    _chosen_bbox = fi_bbox.get(chosen_fi)
+    _chosen_w = _chosen_bbox[2] if _chosen_bbox is not None else None
+    log.info("  [%s] saving fi=%s  (chosen_fi=%d  pred=%s  by=%s  lag=%d  chosen_w=%s)",
              label, [e[3] for e in to_save], chosen_fi,
-             f"{pred:.1f}" if pred is not None else "–", chosen_by, lag)
+             f"{pred:.1f}" if pred is not None else "–", chosen_by, lag,
+             str(_chosen_w) if _chosen_w is not None else "?")
+    if event_meta is not None and _chosen_w is not None:
+        event_meta = dict(event_meta)   # don't mutate caller's dict
+        event_meta['blob_width'] = _chosen_w
     frames_to_save = [(bgr, stem, fi_bbox.get(entry_fi), meta) for bgr, stem, meta, entry_fi in to_save]
     start_save(frames_to_save, event_count, rightward,
                event_meta=event_meta, preview_state=preview_state,
@@ -1022,7 +1053,7 @@ def main():
     vehicle_active        = False
     lockout_remaining     = 0
     event_frames          = 0      # frames since vehicle_active became True
-    centroid_history      = []     # (fi, cx, fully_interior)
+    centroid_history      = []     # (fi, cx, fully_interior, ev)
     vehicle_frame_indices = []     # fi of every VEHICLE-tagged frame
     vehicle_edge_frames   = []     # (fi, touches_left, touches_right) for same frames
     fi_bbox               = {}     # fi → (bx, by, bw, bh) lores bbox for event frames
@@ -1031,9 +1062,13 @@ def main():
     best_center_dist      = float('inf')
     best_center_cx        = None
     max_blob_width        = 0      # max hull width seen during this event
+    interior_blob_widths  = []     # widths from fully-interior (edges=..) confirmed frames
     stuck_frames          = 0      # frames of continuous non-vehicle fg activity
     frame_count           = 0
     fi                    = 0      # detection frame index (increments every frame)
+    # Rolling EV history from non-vehicle frames; used as pre-event baseline
+    # for EV-suspect frame detection.
+    ev_pre_event: collections.deque = collections.deque(maxlen=EV_PRE_EVENT_WINDOW)
 
     # Load daily event counter — reset to 0 if date has changed since last run
     _saved_num, _saved_date = _load_event_num()
@@ -1146,6 +1181,10 @@ def main():
                              stuck_frames, factor, LR_BOOST)
             else:
                 lr = LR_VEHICLE
+        # Track pre-event EV baseline from settled, non-vehicle frames
+        if not vehicle_active and agc_settled:
+            ev_pre_event.append(ev)
+
         fg_mask = fgbg.apply(roi, learningRate=lr)
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN,  kernel)
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
@@ -1187,7 +1226,7 @@ def main():
                     ('R' if blob['touches_right'] else '.')
 
             if blob['area'] >= MIN_CENTROID_AREA:
-                centroid_history.append((fi, cx, blob['fully_interior']))
+                centroid_history.append((fi, cx, blob['fully_interior'], ev))
 
             if consecutive >= MIN_CONSECUTIVE_FRAMES:
                 if not vehicle_active:
@@ -1197,6 +1236,8 @@ def main():
                 vehicle_frame_indices.append(fi)
                 vehicle_edge_frames.append((fi, blob['touches_left'], blob['touches_right']))
                 max_blob_width  = max(max_blob_width, bw)
+                if blob['fully_interior']:
+                    interior_blob_widths.append(bw)
                 log.info("  fi=%d  cx=%.1f  w=%d  h=%d  ar=%.2f  edges=%s",
                          fi, cx, bw, bh, blob['aspect_ratio'], edges)
 
@@ -1221,6 +1262,48 @@ def main():
 
         if not blob and vehicle_active:
             # --- Vehicle event ended -----------------------------------------
+
+            # --- EV-suspect tail trimming ------------------------------------
+            # While a vehicle is in frame, AGC shifts gradually in one direction
+            # (down for bright vehicles, up for dark ones relative to background).
+            # Those gradual frames are still valid detections.  What we want to
+            # remove is the sudden EV *reversal* at the tail when the vehicle
+            # exits and the camera snaps back toward the background exposure.
+            #
+            # Method: use signed EV ratio (ev/ev_ref) to track direction.
+            # Compute the prevailing per-frame trend over the first half of the
+            # event, then scan the second half for the first step whose sign
+            # opposes that trend AND whose magnitude exceeds EV_SUSPECT_THRESHOLD.
+            # Everything from that step onward is trimmed.  This handles both
+            # bright vehicles (EV falling then snapping up on exit) and dark
+            # vehicles (EV rising then snapping down on exit) symmetrically.
+            if EV_SUSPECT_THRESHOLD > 0 and ev_pre_event and len(centroid_history) >= 4:
+                ev_ref = float(np.median(ev_pre_event))
+                if ev_ref > 0:
+                    ratios = [_ev / ev_ref for _, _, _, _ev in centroid_history]
+                    n_ch   = len(ratios)
+                    steps  = [ratios[i] - ratios[i - 1] for i in range(1, n_ch)]
+                    # Prevailing trend: median step over the first half
+                    half       = max(1, n_ch // 2)
+                    trend_sign = np.sign(float(np.median(steps[:half])))
+                    # Scan second half for a step that reverses the trend sharply
+                    trim_from = None
+                    for _i in range(half, n_ch - 1):
+                        step = steps[_i]           # step entering ratios[_i + 1]
+                        if (trend_sign != 0
+                                and np.sign(step) != trend_sign
+                                and abs(step) > EV_SUSPECT_THRESHOLD):
+                            trim_from = _i + 1
+                            break
+                    if trim_from is not None:
+                        n_trimmed = n_ch - trim_from
+                        jump_pct  = abs(steps[trim_from - 1]) * 100
+                        trim_fi   = centroid_history[trim_from][0]
+                        del centroid_history[trim_from:]
+                        log.info("  [ev_trim] removed %d EV-suspect tail frame(s) "
+                                 "from fi=%d (ev_ref=%.0f  reversal=%.0f%%)",
+                                 n_trimmed, trim_fi, ev_ref, jump_pct)
+
             pred, used_int = estimate_center_frame(centroid_history)
             src = "interior" if used_int else "fallback"
 
@@ -1240,7 +1323,7 @@ def main():
 
             def _phase_consistent(phase):
                 """Return True if this phase shows directed motion rather than jitter."""
-                cx_p = [cx for _, cx, _ in phase]
+                cx_p = [cx for _, cx, *_ in phase]
                 if len(cx_p) < 2:
                     return False
                 steps    = [cx_p[i] - cx_p[i-1] for i in range(1, len(cx_p))]
@@ -1280,7 +1363,7 @@ def main():
             # Check motion quality — reject stationary blobs and random jitter.
             # Skip for valid tow+trailer splits or phase1_only saves: phase
             # consistency is already confirmed above.
-            cx_vals = [cx for _, cx, _ in eval_history]
+            cx_vals = [cx for _, cx, *_ in eval_history]
             n_cx = len(cx_vals)
             # Direction of travel for leading-edge blur margin
             rightward = (cx_vals[-1] >= cx_vals[0]) if n_cx >= 2 else True
@@ -1297,7 +1380,7 @@ def main():
             STATIONARY_TAIL_N = 10
             is_long_vehicle = max_blob_width >= HIRES_LONG_VEHICLE_WIDTH
             confirmed_fi_set = set(vehicle_frame_indices)
-            confirmed_cx = [cx for fi, cx, _ in eval_history if fi in confirmed_fi_set]
+            confirmed_cx = [cx for fi, cx, *_ in eval_history if fi in confirmed_fi_set]
             if (MIN_CONFIRMED_CX_STD > 0
                     and not is_long_vehicle
                     and len(confirmed_cx) >= STATIONARY_TAIL_N):
@@ -1354,7 +1437,18 @@ def main():
                 stuck_frames = 0
 
             elif chosen_fi is not None and hires_buf:
-                is_long = max_blob_width >= HIRES_LONG_VEHICLE_WIDTH
+                # Use median of fully-interior frame widths to classify vehicle length.
+                # A single AGC-blown edge-spanning frame cannot inflate this metric.
+                # Fall back to max_blob_width only when no interior frames were seen.
+                if interior_blob_widths:
+                    robust_width = float(np.median(interior_blob_widths))
+                else:
+                    robust_width = float(max_blob_width)
+                is_long = robust_width >= HIRES_LONG_VEHICLE_WIDTH
+                if is_long != (max_blob_width >= HIRES_LONG_VEHICLE_WIDTH):
+                    log.info("  [robust_width] median_interior=%.0f  max=%d  "
+                             "overrides long classification → is_long=%s",
+                             robust_width, max_blob_width, is_long)
 
                 _, _last_date = _load_event_num()
                 if _last_date != datetime.now().strftime('%Y%m%d'):
@@ -1366,8 +1460,8 @@ def main():
                 # (phase1 only when phase1_only, else full centroid history).
                 _velocity = None
                 if len(eval_history) >= 4:
-                    _cx_idx = np.array([f for f, _, _ in eval_history], dtype=np.float32)
-                    _cx_val = np.array([c for _, c, _ in eval_history], dtype=np.float32)
+                    _cx_idx = np.array([f for f, *_ in eval_history], dtype=np.float32)
+                    _cx_val = np.array([c for _, c, *_ in eval_history], dtype=np.float32)
                     _vel_coeffs = np.polyfit(_cx_idx, _cx_val, 1)
                     _velocity = float(_vel_coeffs[0])
 
@@ -1418,9 +1512,12 @@ def main():
                         log.warning("  target fi=%d too far from buffer window — skipping",
                                     adjusted_fi)
                     else:
-                        log.info("  saving fi=%s  (chosen_fi=%d  lag=%d  max_w=%d)",
+                        _chosen_bbox = fi_bbox.get(chosen_fi)
+                        if _chosen_bbox is not None:
+                            _event_meta['blob_width'] = _chosen_bbox[2]
+                        log.info("  saving fi=%s  (chosen_fi=%d  lag=%d  chosen_w=%d  max_w=%d)",
                                  [e[3] for e in to_save], chosen_fi, lag,
-                                 max_blob_width)
+                                 _event_meta['blob_width'], max_blob_width)
                         frames_to_save = [(bgr, stem, fi_bbox.get(entry_fi), meta)
                                           for bgr, stem, meta, entry_fi in to_save]
                         start_save(frames_to_save, event_count, rightward,
@@ -1442,7 +1539,15 @@ def main():
                     ev_baseline = ev
                     stuck_frames = 0
                 else:
-                    is_long = max_blob_width >= HIRES_LONG_VEHICLE_WIDTH
+                    if interior_blob_widths:
+                        robust_width = float(np.median(interior_blob_widths))
+                    else:
+                        robust_width = float(max_blob_width)
+                    is_long = robust_width >= HIRES_LONG_VEHICLE_WIDTH
+                    if is_long != (max_blob_width >= HIRES_LONG_VEHICLE_WIDTH):
+                        log.info("  [robust_width] median_interior=%.0f  max=%d  "
+                                 "overrides long classification → is_long=%s",
+                                 robust_width, max_blob_width, is_long)
                     _, _last_date = _load_event_num()
                     if _last_date != datetime.now().strftime('%Y%m%d'):
                         event_count = 0
@@ -1451,8 +1556,8 @@ def main():
 
                     _velocity = None
                     if len(eval_history) >= 4:
-                        _cx_idx = np.array([f for f, _, _ in eval_history], dtype=np.float32)
-                        _cx_val = np.array([c for _, c, _ in eval_history], dtype=np.float32)
+                        _cx_idx = np.array([f for f, *_ in eval_history], dtype=np.float32)
+                        _cx_val = np.array([c for _, c, *_ in eval_history], dtype=np.float32)
                         _vel_coeffs = np.polyfit(_cx_idx, _cx_val, 1)
                         _velocity = float(_vel_coeffs[0])
 
@@ -1478,8 +1583,12 @@ def main():
                             log.warning("  mid_fi=%.1f too far from buffer window — skipping",
                                         mid_fi)
                         else:
-                            log.info("  saving fi=%s  (mid_fi=%.1f  no interior frames)",
-                                     [e[3] for e in to_save], mid_fi)
+                            # Use the first saved frame's bbox width as the event width
+                            _mid_bbox = fi_bbox.get(to_save[0][3])
+                            if _mid_bbox is not None:
+                                _event_meta['blob_width'] = _mid_bbox[2]
+                            log.info("  saving fi=%s  (mid_fi=%.1f  no interior frames  chosen_w=%d)",
+                                     [e[3] for e in to_save], mid_fi, _event_meta['blob_width'])
                             frames_to_save = [(bgr, stem, fi_bbox.get(entry_fi), meta)
                                               for bgr, stem, meta, entry_fi in to_save]
                             start_save(frames_to_save, event_count, rightward,
@@ -1502,6 +1611,7 @@ def main():
             best_center_dist      = float('inf')
             best_center_cx        = None
             max_blob_width        = 0
+            interior_blob_widths  = []
             stuck_frames          = 0
             lockout_remaining     = LOCKOUT_FRAMES
 
