@@ -37,7 +37,7 @@ from picamera2 import Picamera2
 # Configuration
 # ---------------------------------------------------------------------------
 
-VERSION        = "1.075" # SAVE_MASK constant, MIN_BLOB_BOTTOM_ROW filter
+VERSION        = "1.077" # lux and shutter(us) columns added to CSV log
 FRAME_RATE     = 20.0
 LORES_SIZE     = (320, 240)
 HIRES_SIZE     = (1456, 1088)
@@ -126,6 +126,7 @@ MIN_CENTROID_AREA   = 400 # was 3000, to see motorcycles and bicyclists
 VERBOSE_FG_MIN_PIXELS = 150
 
 MIN_CONSECUTIVE_FRAMES = 4
+MIN_EVENT_FRAMES       = 4   # minimum confirmed frames to accept an event as valid
 LOCKOUT_FRAMES         = 15
 
 # Minimum centroid travel (lores px) for short centroid histories (< 4 points)
@@ -387,11 +388,12 @@ def blur_background(hires_bgr, bbox_lores, rightward=True):
     return result
 
 
-CSV_HEADER = "event,time,epoch,width(px),frames,type,velocity(px/fr)\n"
+CSV_HEADER = "event,time,epoch,width(px),frames,type,velocity(px/fr),lux,shutter(us)\n"
 
 
 def _append_csv_log(event_count, time_str, epoch, blob_width,
-                    event_frames, event_type, velocity, date_str):
+                    event_frames, event_type, velocity, date_str,
+                    lux=None, shutter_us=None):
     """
     Append one row to /home/pi/CAMA/YYYYMMDD_log.csv.
     Creates the file (with header) if it does not yet exist.
@@ -400,9 +402,12 @@ def _append_csv_log(event_count, time_str, epoch, blob_width,
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"{date_str}_log.csv"
     write_header = not log_path.exists()
-    vel_str = f"{velocity:.4f}" if velocity is not None else ""
+    vel_str     = f"{velocity:.4f}"   if velocity   is not None else ""
+    lux_str     = f"{lux:.1f}"        if lux        is not None else ""
+    shutter_str = f"{shutter_us:.0f}" if shutter_us is not None else ""
     row = (f"{event_count},{time_str},{epoch:.3f},"
-           f"{blob_width},{event_frames},{event_type},{vel_str}\n")
+           f"{blob_width},{event_frames},{event_type},{vel_str},"
+           f"{lux_str},{shutter_str}\n")
     try:
         with log_path.open('a') as f:
             if write_header:
@@ -506,7 +511,9 @@ def _save_and_transfer(frames, event_count, rightward=True, event_meta=None,
                     event_count, time_str, epoch,
                     event_meta['blob_width'], event_meta['event_frames'],
                     event_meta['event_type'], event_meta.get('velocity'),
-                    date_str)
+                    date_str,
+                    lux=meta.get('Lux') if meta else None,
+                    shutter_us=meta.get('ExposureTime') if meta else None)
                 if _preview_state is not None:
                     info = dict(event_meta)
                     info['time_str']    = time_str
@@ -1335,6 +1342,15 @@ def main():
                 for _ in range(20):
                     fgbg.apply(roi, learningRate=0.5)
                 ev_baseline = ev   # re-anchor EV baseline to current exposure
+                stuck_frames = 0
+
+            elif event_frames < MIN_EVENT_FRAMES:
+                log.warning("VEHICLE DISCARDED  event_frames=%d < MIN_EVENT_FRAMES=%d — "
+                            "too short; resetting background model",
+                            event_frames, MIN_EVENT_FRAMES)
+                for _ in range(20):
+                    fgbg.apply(roi, learningRate=0.5)
+                ev_baseline = ev
                 stuck_frames = 0
 
             elif chosen_fi is not None and hires_buf:
