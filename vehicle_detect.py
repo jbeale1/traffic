@@ -37,7 +37,7 @@ from picamera2 import Picamera2
 # Configuration
 # ---------------------------------------------------------------------------
 
-VERSION        = "1.084" # avoid classifying white cars as long vehicles
+VERSION        = "1.102" # double timeout for pedestrian events (narrow w, monotonic cx)
 FRAME_RATE     = 20.0
 LORES_SIZE     = (320, 240)
 HIRES_SIZE     = (1456, 1088)
@@ -45,8 +45,8 @@ JPEG_QUALITY   = 95
 
 # Set True to save a lores MOG2 mask PNG alongside every captured JPEG.
 # Useful for algorithm development; disable for normal operation.
-#SAVE_MASK      = True
-SAVE_MASK      = False
+SAVE_MASK      = True
+# SAVE_MASK      = False
 
 # Crop applied to saved full-res JPEGs (in 1456x1088 frame coordinates)
 HIRES_CROP_TOP    = 76
@@ -55,7 +55,7 @@ HIRES_CROP_BOTTOM = 830
 # Background blur applied outside the vehicle bounding box before JPEG save.
 # Reduces file size by softening high-frequency background (trees, grass, etc.).
 BLUR_KERNEL_SIZE  = 7     # must be odd; 7x7 Gaussian
-BLUR_MARGIN_HIRES = 20    # unblurred padding around vehicle bbox (hires pixels)
+BLUR_MARGIN_HIRES = 60    # unblurred padding around vehicle bbox (hires pixels)
 BLUR_LEAD_MARGIN_HIRES = 200  # extra unblurred margin on the leading edge (front of vehicle)
 BLUR_TRAIL_MARGIN_HIRES = 100  # extra unblurred margin on the trailing edge (rear of vehicle)
 # Lores-to-hires scale factors for IMX296 (1456x1088 hires, 320x240 lores)
@@ -101,16 +101,50 @@ def _save_event_num(event_num: int):
 
 # MOG2 detection parameters
 ROI_TOP    = 60
-ROI_BOTTOM = 130
+ROI_BOTTOM = 130  # any lower includes shadows on road
 
-MOG2_HISTORY        = 200
-MOG2_VAR_THRESHOLD  = 35 # was 50  6/2/2026
+MOG2_HISTORY        = 1000
 MOG2_DETECT_SHADOWS = False
+
+# Edge detection parameters (Scharr operator on grayscale lores)
+# Scharr gives better gradient isotropy than Sobel at 3x3.
+# EDGE_BLUR_KSIZE: pre-blur kernel size (must be odd) to suppress noise before
+# gradient computation; 0 to disable.
+EDGE_BLUR_KSIZE = 3
+
+# Fixed clip range for Scharr → uint8 scaling (applied to each signed channel).
+# Each channel (sx, sy) is clipped to [-EDGE_CLIP_MAX, +EDGE_CLIP_MAX] then
+# shifted to [0, 255] with 128 as zero.  This preserves edge direction and sign,
+# giving MOG2 a richer 2-channel joint distribution to model:
+#   - Background foliage: high variance in both channels, mean near 128
+#   - Smooth vehicle panel: both channels near 128 (near-zero gradient) —
+#     different mean from foliage → detected as foreground
+#   - Vehicle boundary: large excursion in sx or sy → outlier from background
+# Per-frame normalisation is NOT used: it destroys absolute magnitude
+# relationships, making a smooth-surfaced vehicle invisible against textured
+# background.
+#
+# Scharr on uint8 input: max possible value ≈ 3600 (hard black→white step).
+# Typical background texture (road, grass) peaks in the 200–600 range.
+# EDGE_CLIP_MAX sets the signed magnitude that maps to 0 or 255.
+EDGE_CLIP_MAX       = 500.0   # tune empirically; raise if background is noisy
+MOG2_VAR_THRESHOLD  = 10      # tune after setting EDGE_CLIP_MAX; 2-ch input needs lower value
 
 MORPH_KERNEL_SIZE = 5
 
+# Horizontal open kernel applied after the standard open/close to suppress the
+# ghost trail left at the vehicle's roofline and road-edge boundaries after it
+# passes.  The trail appears as two thin horizontal strips (top and bottom of
+# the vehicle path) caused by strong boundary edges that MOG2 cannot relearn
+# while LR_VEHICLE=0.0.  A wide, short kernel erodes these strips while
+# preserving the taller filled blob of the vehicle body.
+# Width should be at least as wide as the trail gap between the two strips.
+# Height of 1 makes it maximally selective for thin horizontal artefacts.
+MORPH_HOPEN_W = 15   # pixels; raise if trail persists, lower if vehicle body is eroded
+MORPH_HOPEN_H = 3    # pixels; 1 = only exact single-row strips suppressed
+
 MIN_BLOB_AREA       = 100 # catch smaller objects like bicyclists
-MIN_ASPECT_RATIO    = 0.4
+MIN_ASPECT_RATIO    = 0.34 # capture pedestrians
 MIN_BLOB_WIDTH      = 20
 MIN_BLOB_HEIGHT     = 20   # lowered from 25 to avoid intermittent streak resets on dark cars
 MIN_HULL_FILL_RATIO = 0.44 # lowered from 0.45 to avoid boundary ties
@@ -125,7 +159,7 @@ MIN_CENTROID_AREA   = 400 # was 3000, to see motorcycles and bicyclists
 # Minimum foreground pixel count to log when --verbose-fg is active.
 VERBOSE_FG_MIN_PIXELS = 150
 
-MIN_CONSECUTIVE_FRAMES = 4
+MIN_CONSECUTIVE_FRAMES = 3  # minimum consecutive frames that a blob must persist to start an event
 MIN_EVENT_FRAMES       = 4   # minimum confirmed frames to accept an event as valid
 LOCKOUT_FRAMES         = 15
 
@@ -160,37 +194,33 @@ CENTROID_REVERSAL_THRESHOLD = 50
 LR_NORMAL  = 0.002
 LR_VEHICLE = 0.0
 
-# Two-stage learning rate boost when AGC is stuck unsettled.
-# Stage 1: moderate boost after LR_BOOST_AFTER frames.
-# Stage 2: aggressive boost after LR_BOOST2_AFTER frames to force convergence.
-LR_BOOST            = 0.05
-LR_BOOST_AFTER      = 120   # frames (~6 seconds at 20fps)
-LR_BOOST2           = 0.5
-LR_BOOST2_AFTER     = 600   # frames (~30 seconds at 20fps)
-
-# Correction factor must be within this fraction of 1.0 for MOG2 to resume
-# learning. Widened from 0.02 to allow adaptation after sustained exposure shifts.
-AGC_SETTLED_THRESHOLD = 0.15
-
 # Fractional EV deviation from the pre-event baseline above which a centroid
 # history entry is considered EV-suspect (AGC shifted significantly from the
 # background the MOG2 model was built on).  Suspect frames are trimmed from the
 # tail of centroid_history before motion quality evaluation.
 # 0.15 = 15% EV change, roughly half a stop.  Set to 0 to disable trimming.
+# NOTE: with edge-based input this is less critical but retained as a safety net.
 EV_SUSPECT_THRESHOLD = 0.15
 
 # Number of pre-event frames used to compute the EV baseline for suspect detection.
 EV_PRE_EVENT_WINDOW = 30   # ~1.5 s at 20 fps
 
+# Number of frames after event end to log EV values, to observe AGC recovery.
+EV_POST_EVENT_LOG_FRAMES = 0  # log EV for this many frames after event end, even if no foreground is detected
+
 EDGE_MARGIN  = 3
 FRAME_WIDTH  = LORES_SIZE[0]
 
-# Metadata pipeline delay (frames): picamera2 reports metadata this many
-# frames after the frame it describes.  Used to align correction factors.
-METADATA_DELAY_FRAMES = 2
-
 # Maximum event duration before forced close and background re-adaptation
 MAX_EVENT_FRAMES = int(FRAME_RATE * 2.5)  # 2.5 seconds — coordinated with HIRES_BUFFER_SIZE
+
+# Pedestrian detection: events whose median blob width stays below this threshold
+# and whose cx centroid progresses monotonically across the frame are classified
+# as pedestrians.  Their timeout is extended by this multiplier so a slow-walking
+# person is not force-closed before fully crossing.
+PEDESTRIAN_MAX_W            = 80    # lores px; pedestrians stay narrow across the full event
+PEDESTRIAN_MIN_MONO_FRAC    = 0.75  # fraction of per-frame cx steps that must share the dominant sign
+PEDESTRIAN_TIMEOUT_MULT     = 2     # multiply MAX_EVENT_FRAMES by this for pedestrians
 
 # Rolling buffer of high-res frames kept in RAM.
 # Must be large enough to reach back to the best-centered frame even after
@@ -591,13 +621,12 @@ _PREVIEW_PORT  = 8080
 def _compose_preview(color_frame, fg_mask, blob) -> bytes:
     """
     Build the annotated preview JPEG:
-      - full lores color frame, 2x upscaled (nearest neighbour)
+      - lores color frame cropped to LORES_CROP_TOP..LORES_CROP_BOTTOM rows
       - green tint where fg_mask is nonzero (ROI band only)
       - bounding box if blob is not None
     Returns JPEG bytes.
     """
     vis = color_frame.copy()
-    h, w = vis.shape[:2]
 
     # Green overlay on foreground pixels within the ROI band
     if fg_mask is not None:
@@ -612,6 +641,10 @@ def _compose_preview(color_frame, fg_mask, blob) -> bytes:
         x1 = bx
         y1 = by + ROI_TOP
         cv2.rectangle(vis, (x1, y1), (x1 + bw, y1 + bh), _BBOX_COLOR, _BBOX_THICK)
+
+    # Crop to the rows actually used by the motion detection algorithm
+    vis = vis[LORES_CROP_TOP:LORES_CROP_BOTTOM, :]
+    h, w = vis.shape[:2]
 
     # 2x nearest-neighbour upscale
     vis = cv2.resize(vis, (w * _PREVIEW_SCALE, h * _PREVIEW_SCALE),
@@ -684,7 +717,7 @@ def _flask_thread(state: PreviewState, port: int):
             if frame:
                 yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
                        + frame + b'\r\n')
-            time.sleep(0.05)   # poll at 20 Hz; image itself updates at ~2 fps
+            time.sleep(0.25)   # poll at 20 Hz; image itself updates at ~4 fps
 
     @app.route('/stream')
     def stream():
@@ -725,6 +758,51 @@ def apply_correction(img, factor):
     return np.clip(img.astype(np.float32) * factor, 0, 255).astype(np.uint8)
 
 
+def is_pedestrian_event(vehicle_frame_indices, fi_bbox):
+    """Return True if the current event looks like a pedestrian rather than a vehicle.
+
+    Criteria (both must hold):
+      1. Median blob width over all event frames is below PEDESTRIAN_MAX_W.
+      2. The cx centroid progression is predominantly monotonic: at least
+         PEDESTRIAN_MIN_MONO_FRAC of consecutive-frame cx steps share the same sign
+         (i.e. the object moves steadily in one direction across the frame).
+
+    fi_bbox maps fi → (bx, by, bw, bh) in lores coordinates; cx is approximated
+    as bx + bw/2 from the stored bounding box.
+    """
+    if len(vehicle_frame_indices) < 4:
+        return False
+
+    sorted_fi = sorted(vehicle_frame_indices)
+    widths = []
+    cxs    = []
+    for fi in sorted_fi:
+        bbox = fi_bbox.get(fi)
+        if bbox is not None:
+            bx, by, bw, bh = bbox
+            widths.append(bw)
+            cxs.append(bx + bw / 2.0)
+
+    if not widths:
+        return False
+
+    # Criterion 1: narrow blob throughout the event
+    if float(np.median(widths)) >= PEDESTRIAN_MAX_W:
+        return False
+
+    # Criterion 2: monotonic cx progression
+    if len(cxs) < 2:
+        return False
+    steps = [cxs[i] - cxs[i - 1] for i in range(1, len(cxs))]
+    pos = sum(1 for s in steps if s > 0)
+    neg = sum(1 for s in steps if s < 0)
+    dominant = max(pos, neg)
+    if dominant / len(steps) < PEDESTRIAN_MIN_MONO_FRAC:
+        return False
+
+    return True
+
+
 def find_vehicle_blob(mask):
     """
     Find largest connected component, refine with convex hull of that component.
@@ -744,12 +822,13 @@ def find_vehicle_blob(mask):
             best_label = i
 
     if best_label is None:
-        return None, None
+        return None, None, None
 
     component_mask = (labels == best_label).astype(np.uint8) * 255
     pts = cv2.findNonZero(component_mask)
+
     if pts is None or len(pts) < 3:
-        return None, None
+        return None, None, None
 
     hull   = cv2.convexHull(pts)
     hx, hy, hw, hh = cv2.boundingRect(hull)
@@ -761,8 +840,8 @@ def find_vehicle_blob(mask):
     cx = (m['m10'] / m['m00']) if m['m00'] != 0 else hx + hw / 2.0
     cy = (m['m01'] / m['m00']) if m['m00'] != 0 else hy + hh / 2.0
 
-    if area < MIN_BLOB_AREA:   return None, None
-    if hw   < MIN_BLOB_WIDTH:  return None, None
+    if area < MIN_BLOB_AREA:   return None, None, None
+    if hw   < MIN_BLOB_WIDTH:  return None, None, None
 
     # From here, the blob is large enough to be worth reporting if rejected
     fail = []
@@ -774,7 +853,7 @@ def find_vehicle_blob(mask):
         fail.append(f'bottom={blob_bottom}<{MIN_BLOB_BOTTOM_ROW}(grass/sky blob)')
     if fail:
         reason = f'area={area:.0f} w={hw} h={hh} ar={aspect:.2f} fill={fill:.2f} cx={cx:.0f} FAIL({" ".join(fail)})'
-        return None, reason
+        return None, reason, None
 
     touches_left  = hx <= EDGE_MARGIN
     touches_right = (hx + hw) >= (FRAME_WIDTH - EDGE_MARGIN)
@@ -787,7 +866,7 @@ def find_vehicle_blob(mask):
         'touches_left':   touches_left,
         'touches_right':  touches_right,
         'fully_interior': not touches_left and not touches_right,
-    }, None
+    }, None, component_mask
 
 
 def estimate_center_frame(centroid_history):
@@ -1041,14 +1120,14 @@ def main():
     )
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE))
+    h_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (MORPH_HOPEN_W, MORPH_HOPEN_H))
 
     # --- State ---------------------------------------------------------------
     # Rolling buffer of (hires_bgr, stem, meta, fi) — most recent HIRES_BUFFER_SIZE frames
     hires_buf: collections.deque = collections.deque(maxlen=HIRES_BUFFER_SIZE)
 
-    # Metadata ring buffer for delay compensation
-    meta_buf: collections.deque = collections.deque(maxlen=METADATA_DELAY_FRAMES + 1)
-
+    # Metadata ring buffer kept for EXIF writing only (no delay compensation needed)
     consecutive           = 0
     vehicle_active        = False
     lockout_remaining     = 0
@@ -1063,12 +1142,15 @@ def main():
     best_center_cx        = None
     max_blob_width        = 0      # max hull width seen during this event
     interior_blob_widths  = []     # widths from fully-interior (edges=..) confirmed frames
-    stuck_frames          = 0      # frames of continuous non-vehicle fg activity
     frame_count           = 0
     fi                    = 0      # detection frame index (increments every frame)
     # Rolling EV history from non-vehicle frames; used as pre-event baseline
     # for EV-suspect frame detection.
     ev_pre_event: collections.deque = collections.deque(maxlen=EV_PRE_EVENT_WINDOW)
+    # Per-event AGC tracking
+    ev_event_baseline = 1.0    # median EV from ev_pre_event at event start
+    ev_event_peak     = 1.0    # max EV seen during event
+    ev_post_frames    = 0      # frames logged after event end for recovery tracking
 
     # Load daily event counter — reset to 0 if date has changed since last run
     _saved_num, _saved_date = _load_event_num()
@@ -1118,81 +1200,69 @@ def main():
 
         frame_count += 1
 
-        # Push metadata into delay buffer; retrieve the delayed entry
-        meta_buf.append(meta)
-        delayed_meta = meta_buf[0] if len(meta_buf) == meta_buf.maxlen else meta
-
-        exp    = delayed_meta.get("ExposureTime") or 1.0
-        ag     = delayed_meta.get("AnalogueGain")  or 1.0
-        dg     = delayed_meta.get("DigitalGain")   or 1.0
-        ev     = float(exp) * float(ag) * float(dg)
-
-        # Baseline EV anchored to first frame; re-anchored after prolonged
-        # unsettled state to handle gradual lighting changes (e.g. sunset).
-        if frame_count == 1:
-            ev_baseline = ev
-        factor = ev_baseline / ev if ev > 0 else 1.0
+        # Read EV from metadata — used for centroid history and EV-suspect trimming.
+        # No longer used for pixel correction; edge input is illumination-invariant.
+        exp = meta.get("ExposureTime") or 1.0
+        ag  = meta.get("AnalogueGain")  or 1.0
+        dg  = meta.get("DigitalGain")   or 1.0
+        ev  = float(exp) * float(ag) * float(dg)
 
         # Store high-res frame in rolling buffer (includes fi for later selection)
         hires_buf.append((hires_bgr.copy(), stem, meta, fi))
 
-        # Convert lores YUV420 to BGR for MOG2
+        # Convert lores YUV420 to grayscale for edge detection.
+        # Scharr gradient magnitude is illumination-normalized: a global brightness
+        # scale factor (AGC step, cloud shadow) cancels out in the gradient, so
+        # MOG2 sees a stable background without any EV correction machinery.
         buf_w  = lores_arr.shape[1]
         yuv    = lores_arr[:lores_valid_h * 3 // 2, :buf_w]
         lores_bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
         lores_bgr = lores_bgr[:lores_valid_h, :lores_valid_w]
 
-        # Apply exposure correction and crop to ROI
-        color = apply_correction(lores_bgr, factor)
-        roi   = color[ROI_TOP:ROI_BOTTOM, :]
+        gray = cv2.cvtColor(lores_bgr, cv2.COLOR_BGR2GRAY)
+        if EDGE_BLUR_KSIZE > 0:
+            gray = cv2.GaussianBlur(gray, (EDGE_BLUR_KSIZE, EDGE_BLUR_KSIZE), 0)
+        sx = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
+        sy = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
+        # Encode signed gradient as uint8 centered on 128.
+        # Preserves edge direction so MOG2 models the full joint (sx, sy)
+        # distribution rather than just magnitude — smooth vehicle panels
+        # (both channels near 128) are distinguishable from textured background
+        # (high variance around 128) even when their mean magnitudes overlap.
+        scale = 127.0 / EDGE_CLIP_MAX
+        sx_u8 = np.clip(sx * scale + 128, 0, 255).astype(np.uint8)
+        sy_u8 = np.clip(sy * scale + 128, 0, 255).astype(np.uint8)
+        edge_2ch = np.stack([sx_u8, sy_u8], axis=2)  # shape (H, W, 2)
 
-        # MOG2 learning rate — freeze during vehicle events; boost when AGC
-        # is stuck unsettled; re-anchor ev_baseline after stage-2 boost so
-        # gradual lighting changes (sunset) don't keep the factor permanently off.
-        agc_settled = abs(factor - 1.0) < AGC_SETTLED_THRESHOLD
+        # MOG2 input: 2-channel signed-gradient crop of ROI
+        roi = edge_2ch[ROI_TOP:ROI_BOTTOM, :]
+        # Preview overlay uses sx channel (horizontal edges most visible on vehicles)
+        color = sx_u8
 
+        # MOG2 learning rate — freeze during vehicle events only.
+        # No EV correction or boost logic needed: edges are illumination-invariant.
         if vehicle_active:
             lr = LR_VEHICLE
-            stuck_frames = 0
-        elif agc_settled:
-            lr = LR_NORMAL
-            stuck_frames = 0
         else:
-            stuck_frames += 1
-            if stuck_frames >= LR_BOOST2_AFTER:
-                lr = LR_BOOST2
-                if stuck_frames == LR_BOOST2_AFTER:
-                    log.info("[adapt] stuck %d frames (factor=%.4f) — stage-2 boost LR=%.2f",
-                             stuck_frames, factor, LR_BOOST2)
-                # After running stage-2 boost for a full LR_BOOST2_AFTER interval,
-                # re-anchor the baseline so factor returns near 1.0 and normal
-                # operation can resume. This handles gradual lighting drift.
-                if stuck_frames >= LR_BOOST2_AFTER * 2:
-                    ev_baseline = ev
-                    stuck_frames = 0
-                    lr = LR_NORMAL
-                    log.info("[adapt] re-anchoring ev_baseline=%.1f after prolonged boost", ev)
-                else:
-                    lr = LR_BOOST2
-            elif stuck_frames >= LR_BOOST_AFTER:
-                lr = LR_BOOST
-                if stuck_frames == LR_BOOST_AFTER:
-                    log.info("[adapt] stuck %d frames (factor=%.4f) — stage-1 boost LR=%.3f",
-                             stuck_frames, factor, LR_BOOST)
-            else:
-                lr = LR_VEHICLE
-        # Track pre-event EV baseline from settled, non-vehicle frames
-        if not vehicle_active and agc_settled:
+            lr = LR_NORMAL
+
+        # Track pre-event EV for EV-suspect tail trimming (retained as safety net)
+        if not vehicle_active:
             ev_pre_event.append(ev)
 
         fg_mask = fgbg.apply(roi, learningRate=lr)
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN,  kernel)
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+        # Suppress horizontal ghost strips at vehicle roofline/road-edge boundaries.
+        # These appear as thin horizontal bands in the already-vacated region behind
+        # the vehicle; the wide short kernel removes them while preserving the taller
+        # filled vehicle blob.
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN,  h_kernel)
 
         if args.verbose_fg:
             fg_count = cv2.countNonZero(fg_mask)
             if fg_count >= VERBOSE_FG_MIN_PIXELS:
-                log.info("  fi=%d  fg_pixels=%d  factor=%.4f", fi, fg_count, factor)
+                log.info("  fi=%d  fg_pixels=%d  ev=%.1f", fi, fg_count, ev)
 
         # Blob detection
         if lockout_remaining > 0:
@@ -1202,9 +1272,9 @@ def main():
             with preview_state.lock:
                 preview_state.blob = None
         else:
-            blob, reject_reason = find_vehicle_blob(fg_mask)
-            if reject_reason:
-                log.info("  fi=%d  REJECTED  %s", fi, reject_reason)
+            blob, reject_reason, blob_mask = find_vehicle_blob(fg_mask)
+            # if reject_reason:
+            #    log.info("  fi=%d  REJECTED  %s", fi, reject_reason)
             with preview_state.lock:
                 preview_state.blob = blob
 
@@ -1221,7 +1291,7 @@ def main():
 
             bx, by, bw, bh = blob['bbox']
             fi_bbox[fi] = (bx, by, bw, bh)
-            fi_mask[stem] = fg_mask.copy() if SAVE_MASK else None
+            fi_mask[stem] = blob_mask.copy() if (SAVE_MASK and blob_mask is not None) else None
             edges = ('L' if blob['touches_left'] else '.') + \
                     ('R' if blob['touches_right'] else '.')
 
@@ -1231,6 +1301,11 @@ def main():
             if consecutive >= MIN_CONSECUTIVE_FRAMES:
                 if not vehicle_active:
                     log.info("VEHICLE START  frame=%d", frame_count)
+                    ev_event_baseline = float(np.median(ev_pre_event)) if ev_pre_event else ev
+                    ev_event_peak     = ev
+                    ev_post_frames    = 0
+                    log.info("  [agc] event start  exp=%.0f  ag=%.2f  dg=%.2f  ev=%.1f",
+                             exp, ag, dg, ev)
                 vehicle_active  = True
                 event_frames   += 1
                 vehicle_frame_indices.append(fi)
@@ -1238,8 +1313,12 @@ def main():
                 max_blob_width  = max(max_blob_width, bw)
                 if blob['fully_interior']:
                     interior_blob_widths.append(bw)
-                log.info("  fi=%d  cx=%.1f  w=%d  h=%d  ar=%.2f  edges=%s",
-                         fi, cx, bw, bh, blob['aspect_ratio'], edges)
+                log.info("  fi=%d  cx=%.1f  w=%d  h=%d  ar=%.2f  edges=%s"
+                         "  exp=%.0f  ag=%.2f  ev=%.1f  ev_ratio=%.3f",
+                         fi, cx, bw, bh, blob['aspect_ratio'], edges,
+                         exp, ag, ev,
+                         ev / ev_event_baseline if ev_event_baseline else 1.0)
+                ev_event_peak = max(ev_event_peak, ev)
 
                 if blob['fully_interior']:
                     dist = abs(cx - FRAME_WIDTH / 2)
@@ -1252,9 +1331,15 @@ def main():
                          fi, cx, bw, bh, blob['aspect_ratio'], edges,
                          consecutive, MIN_CONSECUTIVE_FRAMES)
 
-            # Force-close event if it runs too long
-            if vehicle_active and event_frames >= MAX_EVENT_FRAMES:
-                log.warning("VEHICLE TIMEOUT  frame=%d — forcing close", frame_count)
+            # Force-close event if it runs too long.
+            # Pedestrians (narrow blob, monotonic cx) get a doubled timeout so a
+            # slow-walking person crossing the full frame is not prematurely closed.
+            _ped = (vehicle_active
+                    and is_pedestrian_event(vehicle_frame_indices, fi_bbox))
+            _max_frames = MAX_EVENT_FRAMES * (PEDESTRIAN_TIMEOUT_MULT if _ped else 1)
+            if vehicle_active and event_frames >= _max_frames:
+                log.warning("VEHICLE TIMEOUT  frame=%d — forcing close%s",
+                            frame_count, "  [pedestrian]" if _ped else "")
                 blob = None   # fall through to close logic below
                 # Re-adapt MOG2 quickly to current background
                 for _ in range(10):
@@ -1411,6 +1496,11 @@ def main():
                 motion_desc = (f"travel={travel:.1f}  (short history, n={n_cx})"
                                + (f"  cx_std={confirmed_cx_std:.1f}" if confirmed_cx_std is not None else ""))
 
+            log.info("  [agc] event end    exp=%.0f  ag=%.2f  dg=%.2f  ev=%.1f"
+                     "  baseline=%.1f  peak=%.1f  peak_ratio=%.3f",
+                     exp, ag, dg, ev,
+                     ev_event_baseline, ev_event_peak,
+                     ev_event_peak / ev_event_baseline if ev_event_baseline else 1.0)
             log.info("VEHICLE END  event=%d  best_fi=%s  pred=%.1f  src=%s  by=%s  %s",
                      event_count + 1,
                      chosen_fi if chosen_fi is not None else '–',
@@ -1424,8 +1514,6 @@ def main():
                 # Force MOG2 to rapidly re-learn the current frame as background
                 for _ in range(20):
                     fgbg.apply(roi, learningRate=0.5)
-                ev_baseline = ev   # re-anchor EV baseline to current exposure
-                stuck_frames = 0
 
             elif event_frames < MIN_EVENT_FRAMES:
                 log.warning("VEHICLE DISCARDED  event_frames=%d < MIN_EVENT_FRAMES=%d — "
@@ -1433,8 +1521,6 @@ def main():
                             event_frames, MIN_EVENT_FRAMES)
                 for _ in range(20):
                     fgbg.apply(roi, learningRate=0.5)
-                ev_baseline = ev
-                stuck_frames = 0
 
             elif chosen_fi is not None and hires_buf:
                 # Use median of fully-interior frame widths to classify vehicle length.
@@ -1536,8 +1622,6 @@ def main():
                                 "resetting background model")
                     for _ in range(20):
                         fgbg.apply(roi, learningRate=0.5)
-                    ev_baseline = ev
-                    stuck_frames = 0
                 else:
                     if interior_blob_widths:
                         robust_width = float(np.median(interior_blob_widths))
@@ -1612,13 +1696,21 @@ def main():
             best_center_cx        = None
             max_blob_width        = 0
             interior_blob_widths  = []
-            stuck_frames          = 0
             lockout_remaining     = LOCKOUT_FRAMES
+            ev_post_frames        = EV_POST_EVENT_LOG_FRAMES
 
         elif not blob:
             # No event, no vehicle: reset consecutive counter
             consecutive  = 0
             event_frames = 0
+            # Log EV recovery for POST_EVENT_LOG_FRAMES frames after an event ends
+            if ev_post_frames > 0:
+                log.info("  [agc] post-event +%d  exp=%.0f  ag=%.2f  dg=%.2f  ev=%.1f"
+                         "  ev_ratio=%.3f",
+                         EV_POST_EVENT_LOG_FRAMES - ev_post_frames + 1,
+                         exp, ag, dg, ev,
+                         ev / ev_event_baseline if ev_event_baseline else 1.0)
+                ev_post_frames -= 1
 
         _now = datetime.now()
         if _now >= _next_minute:
@@ -1633,7 +1725,7 @@ def main():
 
         # Write preview frame at ~4 fps
         if fi % int(FRAME_RATE / 4) == 0:
-            _preview_writer(preview_state, color, fg_mask)
+            _preview_writer(preview_state, lores_bgr, fg_mask)
 
         fi += 1
 
