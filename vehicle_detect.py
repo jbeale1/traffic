@@ -13,12 +13,14 @@ Usage:
 """
 
 import dataclasses
+import json
 import math
 import argparse
 import collections
 import csv
 import logging
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -37,7 +39,7 @@ from picamera2 import Picamera2
 # Configuration
 # ---------------------------------------------------------------------------
 
-VERSION        = "1.102" # double timeout for pedestrian events (narrow w, monotonic cx)
+VERSION        = "1.105" # receive lidar events via UDP, log in CSV
 FRAME_RATE     = 20.0
 LORES_SIZE     = (320, 240)
 HIRES_SIZE     = (1456, 1088)
@@ -45,12 +47,12 @@ JPEG_QUALITY   = 95
 
 # Set True to save a lores MOG2 mask PNG alongside every captured JPEG.
 # Useful for algorithm development; disable for normal operation.
-SAVE_MASK      = True
-# SAVE_MASK      = False
+#SAVE_MASK      = True
+SAVE_MASK      = False
 
 # Crop applied to saved full-res JPEGs (in 1456x1088 frame coordinates)
-HIRES_CROP_TOP    = 76
-HIRES_CROP_BOTTOM = 830
+HIRES_CROP_TOP    = 76+91  # add 91 pixels to make active region centered on sensor
+HIRES_CROP_BOTTOM = 830+91
 
 # Background blur applied outside the vehicle bounding box before JPEG save.
 # Reduces file size by softening high-frequency background (trees, grass, etc.).
@@ -100,8 +102,8 @@ def _save_event_num(event_num: int):
         log.warning("[event_num] failed to save state: %s", e)
 
 # MOG2 detection parameters
-ROI_TOP    = 60
-ROI_BOTTOM = 130  # any lower includes shadows on road
+ROI_TOP    = 60+20
+ROI_BOTTOM = 130+20+6  # any lower includes shadows on road
 
 MOG2_HISTORY        = 1000
 MOG2_DETECT_SHADOWS = False
@@ -248,6 +250,227 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("vehicle_detect")
+
+# ---------------------------------------------------------------------------
+# LiDAR event receiver  (UDP, port 5006)
+# Buffers incoming LiDAR events for correlation with camera events.
+# ---------------------------------------------------------------------------
+
+LIDAR_UDP_PORT       = 5006  # must match CAMERA_PORT in lidar_events.py
+# Asymmetric match window: LiDAR often fires before the camera epoch (which comes
+# from the best-centered frame, near the middle/end of a slow pedestrian crossing).
+# EARLY covers the case where LiDAR precedes camera; LATE covers late UDP delivery.
+LIDAR_MATCH_EARLY  = 3.0   # seconds: LiDAR may precede camera epoch by up to this
+LIDAR_MATCH_LATE   = 2.0   # seconds: LiDAR may follow  camera epoch by up to this
+LIDAR_BUFFER_TTL   = 10.0  # seconds: discard stale entries from both pools
+
+# _lidar_pending: camera event info dicts not yet matched.
+# Keyed by id(info); UDP thread updates them in-place.
+_lidar_pending: dict = {}   # id(info) -> info dict
+
+# _lidar_pkt_buf: received LiDAR packets not yet matched to a camera event.
+# Each entry: {"t", "dur", "d", "wall_t", "fi"}.
+# wall_t = time.time() at receipt; fi = main-loop frame index at receipt.
+# After LIDAR_SYNTH_WAIT seconds without a native match, the main loop
+# promotes the entry to a synthetic event.
+_lidar_pkt_buf: list = []
+
+_lidar_lock = threading.Lock()
+
+# Deduplication: track recently seen LiDAR packet timestamps to discard retransmits.
+# Dict of {t_rounded: wall_time_seen}; pruned in the UDP listener timeout handler.
+_lidar_seen: dict = {}
+LIDAR_DEDUP_TTL = 5.0   # seconds to remember a seen packet timestamp
+
+# Frame index shared between main loop and UDP listener so packets can record
+# which frame was current on arrival.  Written only by main loop (CPython GIL safe).
+_current_fi: int = 0
+
+LIDAR_SYNTH_WAIT = 2.0   # seconds: if no native event matches within this time,
+                          # promote the LiDAR packet to a synthetic camera event
+
+
+def _lidar_in_window(camera_epoch: float, lt: float) -> bool:
+    """Return True if lt falls within the asymmetric match window around camera_epoch."""
+    dt = camera_epoch - lt   # positive = LiDAR earlier than camera
+    return -LIDAR_MATCH_LATE <= dt <= LIDAR_MATCH_EARLY
+
+
+def _try_match_pkt(lt: float, dur: int, dist: float) -> bool:
+    """Try to match a LiDAR packet against _lidar_pending (caller holds no lock).
+    Returns True if matched."""
+    with _lidar_lock:
+        candidates = [(abs(info["epoch"] - lt), k, info)
+                      for k, info in _lidar_pending.items()
+                      if info.get("lidar_d") is None
+                      and _lidar_in_window(info["epoch"], lt)]
+    if not candidates:
+        return False
+    best_dt, best_k, best_info = min(candidates, key=lambda x: x[0])
+    if not _lidar_in_window(best_info["epoch"], lt):
+        return False
+    best_info["lidar_t"]   = lt
+    best_info["lidar_dur"] = dur
+    best_info["lidar_d"]   = dist
+    best_info["lidar_dt"]  = round(best_info["epoch"] - lt, 3)
+    log.info("[lidar_match] event %s  dt=%.3f s  dur=%d ms  d=%.3f m",
+             best_info.get("event_count"), best_info["lidar_dt"], dur, dist)
+    with _lidar_lock:
+        _lidar_pending.pop(best_k, None)
+    _write_csv_for_event(best_info)
+    return True
+
+
+def _lidar_register(info: dict):
+    """Register a newly completed camera event as awaiting a LiDAR match.
+
+    Three paths:
+    1. Synthetic event: event_meta contains '_lidar_prefill' — lidar fields already
+       known; write CSV immediately, no match search needed.
+    2. Buffered packet: a LiDAR packet arrived before _lidar_register was called;
+       match it from _lidar_pkt_buf and write CSV immediately.
+    3. No match yet: add to _lidar_pending; UDP listener will fill fields in-place
+       when packet arrives.  A fallback timer writes CSV without lidar data after
+       CSV_LIDAR_WAIT seconds if still unmatched.
+    """
+    # Path 1: synthetic event — lidar data pre-filled by _save_synthetic_event
+    prefill = info.pop("_lidar_prefill", None)
+    if prefill is not None:
+        epoch = info["epoch"]
+        info["lidar_t"]   = prefill["t"]
+        info["lidar_dur"] = prefill["dur"]
+        info["lidar_d"]   = prefill["d"]
+        info["lidar_dt"]  = round(epoch - prefill["t"], 3)
+        _write_csv_for_event(info)
+        return
+
+    epoch = info["epoch"]
+    # Path 2: check for a buffered packet that arrived before this call
+    with _lidar_lock:
+        candidates = [(abs(p["t"] - epoch), i)
+                      for i, p in enumerate(_lidar_pkt_buf)
+                      if _lidar_in_window(epoch, p["t"])]
+    if candidates:
+        best_dt, best_i = min(candidates, key=lambda x: x[0])
+        if _lidar_in_window(epoch, _lidar_pkt_buf[best_i]["t"]):
+            with _lidar_lock:
+                pkt = _lidar_pkt_buf.pop(best_i)
+            info["lidar_t"]   = pkt["t"]
+            info["lidar_dur"] = pkt["dur"]
+            info["lidar_d"]   = pkt["d"]
+            info["lidar_dt"]  = round(epoch - pkt["t"], 3)
+            log.info("[lidar_match] event %s  dt=%.3f s  dur=%d ms  d=%.3f m (buffered pkt)",
+                     info.get("event_count"), info["lidar_dt"], pkt["dur"], pkt["d"])
+            _write_csv_for_event(info)
+            return
+
+    # Path 3: no immediate match — register and set a fallback CSV timer
+    with _lidar_lock:
+        _lidar_pending[id(info)] = info
+    def _csv_fallback():
+        still_pending = False
+        with _lidar_lock:
+            still_pending = id(info) in _lidar_pending
+            if still_pending:
+                _lidar_pending.pop(id(info), None)
+        if still_pending:
+            log.info("[csv] no lidar match for event %s after %.1f s — writing without",
+                     info.get("event_count"), CSV_LIDAR_WAIT)
+            _write_csv_for_event(info)
+    threading.Timer(CSV_LIDAR_WAIT, _csv_fallback).start()
+
+
+def _lidar_udp_listener():
+    """Background thread: receive LiDAR UDP packets.
+    On each packet: try to match against _lidar_pending (camera event already
+    registered).  If no match, buffer the packet in _lidar_pkt_buf so that a
+    camera event registering slightly later can still find it.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(('', LIDAR_UDP_PORT))
+    except OSError as e:
+        log.error("[lidar_udp] bind failed on port %d: %s", LIDAR_UDP_PORT, e)
+        return
+    log.info("[lidar_udp] listening on UDP port %d", LIDAR_UDP_PORT)
+    sock.settimeout(2.0)
+    while True:
+        try:
+            data, addr = sock.recvfrom(256)
+            pkt  = json.loads(data.decode())
+            lt   = float(pkt["t"])
+            dur  = int(pkt["dur"])
+            dist = float(pkt["d"])
+            log.info("[lidar_udp] rx from %s: t=%.3f dur=%d ms d=%.3f m",
+                     addr[0], lt, dur, dist)
+            # Discard retransmit duplicates
+            with _lidar_lock:
+                if lt in _lidar_seen:
+                    log.info("[lidar_udp] duplicate (retransmit) — discarded")
+                    continue
+                _lidar_seen[lt] = time.time()
+            if not _try_match_pkt(lt, dur, dist):
+                # Camera event not yet registered — buffer packet for deferred match
+                # or synthetic event promotion after LIDAR_SYNTH_WAIT seconds.
+                with _lidar_lock:
+                    _lidar_pkt_buf.append({
+                        "t": lt, "dur": dur, "d": dist,
+                        "wall_t": time.time(), "fi": _current_fi,
+                    })
+                log.info("[lidar_udp] buffered for deferred match (fi=%d)", _current_fi)
+        except socket.timeout:
+            # Prune stale entries from both pools
+            now = time.time()
+            with _lidar_lock:
+                stale_k = [k for k, info in _lidar_pending.items()
+                           if now - info.get("epoch", now) > LIDAR_BUFFER_TTL]
+                for k in stale_k:
+                    _lidar_pending.pop(k, None)
+                _lidar_pkt_buf[:] = [p for p in _lidar_pkt_buf
+                                     if now - p["t"] <= LIDAR_BUFFER_TTL]
+                stale_seen = [t for t, seen_at in _lidar_seen.items()
+                              if now - seen_at > LIDAR_DEDUP_TTL]
+                for t in stale_seen:
+                    _lidar_seen.pop(t, None)
+        except Exception as e:
+            log.warning("[lidar_udp] rx error: %s", e)
+
+
+threading.Thread(target=_lidar_udp_listener, daemon=True,
+                 name="lidar_udp").start()
+
+
+def _save_synthetic_event(pkt: dict, hires_buf, event_count: int,
+                          preview_state) -> None:
+    """Save a synthetic (LiDAR-only) event: two frames bracketing the UDP packet
+    arrival frame.  event_type='lidar', no background blur (bbox=None).
+    LiDAR fields are pre-filled in event_meta so _lidar_register skips the
+    match search and writes the CSV row immediately."""
+    target_fi = pkt["fi"]
+    to_save   = _select_frames(hires_buf, target_fi)
+    if to_save is None:
+        log.warning("[lidar_synth] event %d: fi=%d not in hires_buf — skipping",
+                    event_count, target_fi)
+        return
+
+    frames_to_save = [(bgr, stem, None, meta) for bgr, stem, meta, entry_fi in to_save]
+
+    # Pre-fill lidar fields; _lidar_register detects lidar_d already set and
+    # skips the match search, writing the CSV row directly.
+    event_meta = {
+        'blob_width':   0,
+        'event_frames': 0,
+        'event_type':   'lidar',
+        'velocity':     None,
+        '_lidar_prefill': {
+            "t": pkt["t"], "dur": pkt["dur"], "d": pkt["d"],
+        },
+    }
+    log.info("[lidar_synth] event %d  fi=%s  d=%.3f m  dur=%d ms",
+             event_count, [e[3] for e in to_save], pkt["d"], pkt["dur"])
+    start_save(frames_to_save, event_count, rightward=True,
+               event_meta=event_meta, preview_state=preview_state)
 
 # ---------------------------------------------------------------------------
 # Timing helpers  (from lores_burst.py)
@@ -436,26 +659,37 @@ def blur_background(hires_bgr, bbox_lores, rightward=True):
     return result
 
 
-CSV_HEADER = "event,time,epoch,width(px),frames,type,velocity(px/fr),lux,shutter(us)\n"
+CSV_HEADER = ("event,time,epoch,width(px),frames,type,velocity(px/fr),"
+              "lux,shutter(us),lidar_d(m),lidar_dur(ms),lidar_dt(ms)\n")
+
+# Seconds to wait for a LiDAR match before writing the CSV row without lidar data
+CSV_LIDAR_WAIT = 4.0   # seconds to wait for lidar match before writing CSV without it
+                       # must exceed LIDAR_MATCH_LATE plus worst-case UDP transit delay
 
 
 def _append_csv_log(event_count, time_str, epoch, blob_width,
                     event_frames, event_type, velocity, date_str,
-                    lux=None, shutter_us=None):
+                    lux=None, shutter_us=None,
+                    lidar_d=None, lidar_dur=None, lidar_dt=None):
     """
     Append one row to /home/pi/CAMA/YYYYMMDD_log.csv.
     Creates the file (with header) if it does not yet exist.
     date_str is 'YYYYMMDD', derived from the capture timestamp.
+    lidar_dt is in seconds internally; stored in CSV as milliseconds.
     """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"{date_str}_log.csv"
     write_header = not log_path.exists()
-    vel_str     = f"{velocity:.4f}"   if velocity   is not None else ""
-    lux_str     = f"{lux:.1f}"        if lux        is not None else ""
-    shutter_str = f"{shutter_us:.0f}" if shutter_us is not None else ""
+    vel_str       = f"{velocity:.4f}"        if velocity   is not None else ""
+    lux_str       = f"{lux:.1f}"             if lux        is not None else ""
+    shutter_str   = f"{shutter_us:.0f}"      if shutter_us is not None else ""
+    lidar_d_str   = f"{lidar_d:.3f}"         if lidar_d    is not None else ""
+    lidar_dur_str = f"{lidar_dur}"            if lidar_dur  is not None else ""
+    lidar_dt_str  = f"{lidar_dt * 1000:.0f}" if lidar_dt   is not None else ""
     row = (f"{event_count},{time_str},{epoch:.3f},"
            f"{blob_width},{event_frames},{event_type},{vel_str},"
-           f"{lux_str},{shutter_str}\n")
+           f"{lux_str},{shutter_str},"
+           f"{lidar_d_str},{lidar_dur_str},{lidar_dt_str}\n")
     try:
         with log_path.open('a') as f:
             if write_header:
@@ -463,6 +697,17 @@ def _append_csv_log(event_count, time_str, epoch, blob_width,
             f.write(row)
     except Exception as e:
         log.warning("[csv] failed to write log: %s", e)
+
+
+def _write_csv_for_event(info: dict):
+    """Write the CSV row for a completed event, including any lidar data now in info."""
+    _append_csv_log(
+        info['event_count'], info['time_str'], info['epoch'],
+        info['blob_width'], info['event_frames'], info['event_type'],
+        info.get('velocity'), info['date_str'],
+        lux=info.get('lux'), shutter_us=info.get('shutter_us'),
+        lidar_d=info.get('lidar_d'), lidar_dur=info.get('lidar_dur'),
+        lidar_dt=info.get('lidar_dt'))
 
 
 def _build_mask_png(fg_mask_roi, lores_w=320):
@@ -556,20 +801,25 @@ def _save_and_transfer(frames, event_count, rightward=True, event_meta=None,
                     time_str = '??:??:??.???'
                     epoch    = 0.0
                     date_str = datetime.now().strftime('%Y%m%d')
-                _append_csv_log(
-                    event_count, time_str, epoch,
-                    event_meta['blob_width'], event_meta['event_frames'],
-                    event_meta['event_type'], event_meta.get('velocity'),
-                    date_str,
-                    lux=meta.get('Lux') if meta else None,
-                    shutter_us=meta.get('ExposureTime') if meta else None)
+                # Build info dict with all data needed for CSV and web display.
+                # CSV write is deferred to _lidar_register / _write_csv_for_event
+                # so lidar fields can be included if a match arrives within CSV_LIDAR_WAIT.
+                info = dict(event_meta)
+                info['time_str']    = time_str
+                info['event_count'] = event_count
+                info['epoch']       = epoch
+                info['date_str']    = date_str
+                info['lux']         = meta.get('Lux') if meta else None
+                info['shutter_us']  = meta.get('ExposureTime') if meta else None
+                info['lidar_t']     = None
+                info['lidar_dur']   = None
+                info['lidar_d']     = None
+                info['lidar_dt']    = None
                 if _preview_state is not None:
-                    info = dict(event_meta)
-                    info['time_str']    = time_str
-                    info['event_count'] = event_count
                     with _preview_state.lock:
                         _preview_state.event_history = (
                             [info] + _preview_state.event_history)[:5]
+                _lidar_register(info)
             first_frame = False
         saved.append(fname)
         log.info("[save] event %d  → %s", event_count, fname)
@@ -690,12 +940,22 @@ def _flask_thread(state: PreviewState, port: int):
             '  fetch("/info").then(r=>r.json()).then(arr=>{'
             '    if(!arr.length){return;}'
             '    var lines=arr.slice().reverse().map(function(d){'
+            '      var lidar = "";'
+            '      if(d.lidar_d !== null && d.lidar_d !== undefined){'
+            '        var dtSign = d.lidar_dt >= 0 ? "+" : "";'
+            '        lidar = "  lidar:" + d.lidar_d.toFixed(2) + "m"'
+            '               + " " + d.lidar_dur + "ms"'
+            '               + " dt=" + dtSign + d.lidar_dt.toFixed(3) + "s";'
+            '      } else {'
+            '        lidar = "  lidar:--";'
+            '      }'
             '      return "#"+d.event_count'
             '        +"  "+d.time_str'
             '        +"  w="+d.blob_width+"px"'
             '        +"  frames="+String(d.event_frames).padStart(2,"0")'
             '        +"  type="+d.event_type'
-            '        +"  vel="+(d.velocity!==null?(d.velocity>=0?"+":"")+d.velocity.toFixed(2):"?")+"px/fr";'
+            '        +"  vel="+(d.velocity!==null?(d.velocity>=0?"+":"")+d.velocity.toFixed(2):"?")+"px/fr"'
+            '        +lidar;'
             '    });'
             '    document.getElementById("info").textContent=lines.join("\\n");'
             '  }).catch(()=>{});'
@@ -1207,6 +1467,32 @@ def main():
         dg  = meta.get("DigitalGain")   or 1.0
         ev  = float(exp) * float(ag) * float(dg)
 
+        # Update shared fi so UDP listener can record which frame is current
+        global _current_fi
+        _current_fi = fi
+
+        # Check for LiDAR packets that timed out without a native event match
+        # and promote them to synthetic events.
+        now = time.time()
+        synth_pkts = []
+        with _lidar_lock:
+            remaining = []
+            for p in _lidar_pkt_buf:
+                if now - p["wall_t"] >= LIDAR_SYNTH_WAIT:
+                    synth_pkts.append(p)
+                else:
+                    remaining.append(p)
+            _lidar_pkt_buf[:] = remaining
+        for pkt in synth_pkts:
+            _, _saved_date = _load_event_num()
+            if _saved_date != datetime.now().strftime('%Y%m%d'):
+                event_count = 0
+            event_count += 1
+            _save_event_num(event_count)
+            log.info("[lidar_synth] no native event — promoting to synthetic event %d",
+                     event_count)
+            _save_synthetic_event(pkt, hires_buf, event_count, preview_state)
+
         # Store high-res frame in rolling buffer (includes fi for later selection)
         hires_buf.append((hires_bgr.copy(), stem, meta, fi))
 
@@ -1546,8 +1832,8 @@ def main():
                 # (phase1 only when phase1_only, else full centroid history).
                 _velocity = None
                 if len(eval_history) >= 4:
-                    _cx_idx = np.array([f for f, *_ in eval_history], dtype=np.float32)
                     _cx_val = np.array([c for _, c, *_ in eval_history], dtype=np.float32)
+                    _cx_idx = np.arange(len(_cx_val), dtype=np.float32)
                     _vel_coeffs = np.polyfit(_cx_idx, _cx_val, 1)
                     _velocity = float(_vel_coeffs[0])
 
@@ -1640,8 +1926,8 @@ def main():
 
                     _velocity = None
                     if len(eval_history) >= 4:
-                        _cx_idx = np.array([f for f, *_ in eval_history], dtype=np.float32)
                         _cx_val = np.array([c for _, c, *_ in eval_history], dtype=np.float32)
+                        _cx_idx = np.arange(len(_cx_val), dtype=np.float32)
                         _vel_coeffs = np.polyfit(_cx_idx, _cx_val, 1)
                         _velocity = float(_vel_coeffs[0])
 
