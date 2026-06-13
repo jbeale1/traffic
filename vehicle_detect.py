@@ -39,7 +39,7 @@ from picamera2 import Picamera2
 # Configuration
 # ---------------------------------------------------------------------------
 
-VERSION        = "1.105" # receive lidar events via UDP, log in CSV
+VERSION        = "1.113" # add focus mode button to web page
 FRAME_RATE     = 20.0
 LORES_SIZE     = (320, 240)
 HIRES_SIZE     = (1456, 1088)
@@ -163,6 +163,7 @@ VERBOSE_FG_MIN_PIXELS = 150
 
 MIN_CONSECUTIVE_FRAMES = 3  # minimum consecutive frames that a blob must persist to start an event
 MIN_EVENT_FRAMES       = 4   # minimum confirmed frames to accept an event as valid
+MIN_INTERIOR_VEL_FRAMES = 3  # minimum interior (edges=..) frames to use for velocity fit
 LOCKOUT_FRAMES         = 15
 
 # Minimum centroid travel (lores px) for short centroid histories (< 4 points)
@@ -659,23 +660,73 @@ def blur_background(hires_bgr, bbox_lores, rightward=True):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Optics: pixel-width → real-world length and speed
+# ---------------------------------------------------------------------------
+# IMX296 sensor active width: 1456 px * 0.00345 mm/px = 5.02 mm
+# Lores width: 320 px spans the full sensor width
+# Lens focal length: 12.0 mm
+# Camera-to-road offset: lidar reports distance to vehicle; add ROAD_OFFSET_M
+# to get the true object distance u (in mm for thin-lens formula).
+SENSOR_WIDTH_MM  = 1456 * 0.00345   # 5.0232 mm
+LORES_WIDTH_PX   = 320
+FOCAL_MM         = 12.0
+ROAD_OFFSET_M    = 11.0             # metres from camera to lidar beam path
+
+def _compute_length_and_speed(blob_width_px: float, lidar_d_m: float,
+                               lidar_dur_ms: int, velocity_px_fr):
+    """Return (length_m, speed_mph) using thin-lens optics, or (None, None)
+    if any required input is missing/zero."""
+    if not blob_width_px or not lidar_d_m or not lidar_dur_ms:
+        return None, None
+    u_mm = (lidar_d_m + ROAD_OFFSET_M) * 1000.0
+    # Thin-lens: 1/v = 1/f - 1/u  →  v = f*u / (u - f)
+    v_mm = (FOCAL_MM * u_mm) / (u_mm - FOCAL_MM)
+    mag  = v_mm / u_mm
+    img_mm  = (blob_width_px / LORES_WIDTH_PX) * SENSOR_WIDTH_MM
+    length_m = (img_mm / mag) / 1000.0
+    t_s      = lidar_dur_ms / 1000.0
+    speed_ms = length_m / t_s
+    speed_mph = speed_ms * 2.23694
+    # Apply direction sign from camera velocity (positive = rightward)
+    if velocity_px_fr is not None and velocity_px_fr < 0:
+        speed_mph = -speed_mph
+    return round(length_m, 2), round(speed_mph, 1)
+
+
 CSV_HEADER = ("event,time,epoch,width(px),frames,type,velocity(px/fr),"
-              "lux,shutter(us),lidar_d(m),lidar_dur(ms),lidar_dt(ms)\n")
+              "lux,shutter(us),lidar_d(m),lidar_dur(ms),lidar_dt(ms),"
+              "length(m),speed_L(mph),speed_C(mph)\n")
 
 # Seconds to wait for a LiDAR match before writing the CSV row without lidar data
 CSV_LIDAR_WAIT = 4.0   # seconds to wait for lidar match before writing CSV without it
                        # must exceed LIDAR_MATCH_LATE plus worst-case UDP transit delay
 
 
+def _compute_vel_mph(velocity_px_fr, lidar_d_m):
+    """Convert camera velocity (lores px/frame) to mph using optics.
+    Returns None if either input is missing."""
+    if velocity_px_fr is None or lidar_d_m is None:
+        return None
+    u_mm    = (lidar_d_m + ROAD_OFFSET_M) * 1000.0
+    v_mm    = (FOCAL_MM * u_mm) / (u_mm - FOCAL_MM)
+    mag     = v_mm / u_mm
+    mm_per_px = (SENSOR_WIDTH_MM / LORES_WIDTH_PX) / mag
+    vel_ms  = velocity_px_fr * FRAME_RATE * mm_per_px / 1000.0
+    return round(vel_ms * 2.23694, 1)
+
+
 def _append_csv_log(event_count, time_str, epoch, blob_width,
                     event_frames, event_type, velocity, date_str,
                     lux=None, shutter_us=None,
-                    lidar_d=None, lidar_dur=None, lidar_dt=None):
+                    lidar_d=None, lidar_dur=None, lidar_dt=None,
+                    length_m=None, speed_mph=None, vel_mph=None):
     """
     Append one row to /home/pi/CAMA/YYYYMMDD_log.csv.
     Creates the file (with header) if it does not yet exist.
     date_str is 'YYYYMMDD', derived from the capture timestamp.
     lidar_dt is in seconds internally; stored in CSV as milliseconds.
+    speed_mph = speed derived from lidar duration (L); vel_mph from camera velocity (C).
     """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"{date_str}_log.csv"
@@ -686,10 +737,14 @@ def _append_csv_log(event_count, time_str, epoch, blob_width,
     lidar_d_str   = f"{lidar_d:.3f}"         if lidar_d    is not None else ""
     lidar_dur_str = f"{lidar_dur}"            if lidar_dur  is not None else ""
     lidar_dt_str  = f"{lidar_dt * 1000:.0f}" if lidar_dt   is not None else ""
+    length_str    = f"{length_m:.2f}"        if length_m   is not None else ""
+    speed_str     = f"{speed_mph:.1f}"       if speed_mph  is not None else ""
+    vel_mph_str   = f"{vel_mph:.1f}"         if vel_mph    is not None else ""
     row = (f"{event_count},{time_str},{epoch:.3f},"
            f"{blob_width},{event_frames},{event_type},{vel_str},"
            f"{lux_str},{shutter_str},"
-           f"{lidar_d_str},{lidar_dur_str},{lidar_dt_str}\n")
+           f"{lidar_d_str},{lidar_dur_str},{lidar_dt_str},"
+           f"{length_str},{speed_str},{vel_mph_str}\n")
     try:
         with log_path.open('a') as f:
             if write_header:
@@ -701,13 +756,31 @@ def _append_csv_log(event_count, time_str, epoch, blob_width,
 
 def _write_csv_for_event(info: dict):
     """Write the CSV row for a completed event, including any lidar data now in info."""
+    length_m, speed_mph = _compute_length_and_speed(
+        info.get('blob_width'), info.get('lidar_d'),
+        info.get('lidar_dur'), info.get('velocity'))
+    vel_mph = _compute_vel_mph(info.get('velocity'), info.get('lidar_d'))
     _append_csv_log(
         info['event_count'], info['time_str'], info['epoch'],
         info['blob_width'], info['event_frames'], info['event_type'],
         info.get('velocity'), info['date_str'],
         lux=info.get('lux'), shutter_us=info.get('shutter_us'),
         lidar_d=info.get('lidar_d'), lidar_dur=info.get('lidar_dur'),
-        lidar_dt=info.get('lidar_dt'))
+        lidar_dt=info.get('lidar_dt'),
+        length_m=length_m, speed_mph=speed_mph, vel_mph=vel_mph)
+
+
+def _fit_velocity(history):
+    """Compute signed velocity (lores px/frame) by linear regression.
+    Prefers fully-interior (edges=..) frames when at least 4 are available,
+    falling back to the full history otherwise.  Returns None if too few points."""
+    interior = [(fi, cx) for fi, cx, full, *_ in history if full]
+    pts = interior if len(interior) >= MIN_INTERIOR_VEL_FRAMES else [(fi, cx) for fi, cx, *_ in history]
+    if len(pts) < 4:
+        return None
+    _cx_val = np.array([cx for _, cx in pts], dtype=np.float32)
+    _cx_idx = np.arange(len(_cx_val), dtype=np.float32)
+    return float(np.polyfit(_cx_idx, _cx_val, 1)[0])
 
 
 def _build_mask_png(fg_mask_roi, lores_w=320):
@@ -815,6 +888,7 @@ def _save_and_transfer(frames, event_count, rightward=True, event_meta=None,
                 info['lidar_dur']   = None
                 info['lidar_d']     = None
                 info['lidar_dt']    = None
+                info.setdefault('blob_x', None)
                 if _preview_state is not None:
                     with _preview_state.lock:
                         _preview_state.event_history = (
@@ -855,9 +929,14 @@ def start_save(frames, event_count, rightward=True, event_meta=None,
 class PreviewState:
     lock:          threading.Lock = dataclasses.field(default_factory=threading.Lock)
     jpeg:          bytes | None   = None   # latest encoded frame
+    focus_jpeg:    bytes | None   = None   # latest 320px center crop of hires frame
+    focus_mode:    bool           = False  # True → /stream serves focus_jpeg
     blob:          dict | None    = None   # latest blob dict (or None between events)
     fg_mask:       object         = None   # latest fg_mask ndarray (ROI coords)
     event_history: list           = dataclasses.field(default_factory=list)  # up to 5 recent events, newest first
+
+# Horizontal offset for 320 px center crop of the 1456 px wide hires frame
+_FOCUS_CROP_X = (HIRES_SIZE[0] - LORES_SIZE[0]) // 2   # = 568
 
 
 _OVERLAY_COLOR = (0, 200, 0)    # green tint for motion mask pixels  (BGR)
@@ -904,13 +983,19 @@ def _compose_preview(color_frame, fg_mask, blob) -> bytes:
     return buf.tobytes() if ok else b''
 
 
-def _preview_writer(state: PreviewState, color_frame, fg_mask):
-    """Called from the main loop at ~1 fps. Reads current blob from state."""
+def _preview_writer(state: PreviewState, color_frame, fg_mask, hires_bgr=None):
+    """Called from the main loop at ~4 fps. Reads current blob from state."""
     with state.lock:
         blob = state.blob
     jpeg = _compose_preview(color_frame, fg_mask, blob)
     with state.lock:
         state.jpeg = jpeg
+        if hires_bgr is not None:
+            # 320 px center crop of full hires frame, vertically cropped same as saves
+            crop = hires_bgr[HIRES_CROP_TOP:HIRES_CROP_BOTTOM,
+                             _FOCUS_CROP_X:_FOCUS_CROP_X + LORES_SIZE[0]]
+            ok, buf = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            state.focus_jpeg = buf.tobytes() if ok else state.focus_jpeg
 
 
 def _flask_thread(state: PreviewState, port: int):
@@ -926,38 +1011,118 @@ def _flask_thread(state: PreviewState, port: int):
             'body{margin:0;background:#111;display:flex;flex-direction:column;'
             'align-items:center;justify-content:center;min-height:100vh;gap:12px}'
             'img{image-rendering:pixelated;max-width:100%}'
-            '#thumb{opacity:0.85}'
+            '#thumb-wrap{position:relative;display:inline-block}'
+            '#thumb{opacity:0.85;display:block;max-width:100%}'
+            '#overlay{position:absolute;top:0;left:0;width:100%;height:100%;'
+            'pointer-events:none}'
             '#info{color:#ccc;font-family:monospace;font-size:14px;'
             'background:#1e1e1e;padding:8px 16px;border-radius:4px;'
             'white-space:pre;letter-spacing:0.03em}'
+            '#bbox-btn{font-family:monospace;font-size:13px;padding:4px 12px;'
+            'background:#2a2a2a;color:#ccc;border:1px solid #555;'
+            'border-radius:4px;cursor:pointer}'
+            '#bbox-btn.on{background:#1a4a1a;color:#6f6;border-color:#4a4}'
+            '#focus-btn{font-family:monospace;font-size:13px;padding:4px 12px;'
+            'background:#2a2a2a;color:#ccc;border:1px solid #555;'
+            'border-radius:4px;cursor:pointer}'
+            '#focus-btn.on{background:#1a3a4a;color:#6cf;border-color:#4ac}'
             '</style></head>'
             '<body>'
             '<img src="/stream">'
+            '<div style="display:flex;gap:8px">'
+            '<button id="focus-btn" onclick="toggleFocus()">focus: OFF</button>'
+            '<button id="bbox-btn" onclick="toggleBbox()">bbox overlay: OFF</button>'
+            '</div>'
             '<div id="info">—</div>'
-            '<img id="thumb" src="/thumb">'
+            '<div id="thumb-wrap">'
+            '  <img id="thumb" src="/thumb">'
+            '  <canvas id="overlay"></canvas>'
+            '</div>'
             '<script>'
+            f'var FRAME_RATE={FRAME_RATE};'
+            f'var FOCAL_MM={FOCAL_MM};'
+            f'var SENSOR_WIDTH_MM={SENSOR_WIDTH_MM};'
+            f'var LORES_WIDTH_PX={LORES_WIDTH_PX};'
+            f'var ROAD_OFFSET_M={ROAD_OFFSET_M};'
+            f'var LORES_TO_HIRES_X={LORES_TO_HIRES_X};'
+            'var bboxOn=false;'
+            'var lastEvent=null;'
+            'function toggleFocus(){'
+            '  fetch("/focus",{method:"POST"}).then(r=>r.json()).then(function(d){'
+            '    var btn=document.getElementById("focus-btn");'
+            '    btn.textContent="focus: "+(d.focus?"ON":"OFF");'
+            '    if(d.focus) btn.classList.add("on"); else btn.classList.remove("on");'
+            '  }).catch(()=>{});'
+            '}'
+            'function toggleBbox(){'
+            '  bboxOn=!bboxOn;'
+            '  var btn=document.getElementById("bbox-btn");'
+            '  btn.textContent="bbox overlay: "+(bboxOn?"ON":"OFF");'
+            '  if(bboxOn) btn.classList.add("on"); else btn.classList.remove("on");'
+            '  drawOverlay();'
+            '}'
+            'function drawOverlay(){'
+            '  var thumb=document.getElementById("thumb");'
+            '  var canvas=document.getElementById("overlay");'
+            '  canvas.width=thumb.naturalWidth||thumb.offsetWidth;'
+            '  canvas.height=thumb.naturalHeight||thumb.offsetHeight;'
+            '  var ctx=canvas.getContext("2d");'
+            '  ctx.clearRect(0,0,canvas.width,canvas.height);'
+            '  if(!bboxOn||!lastEvent||lastEvent.blob_x===null||lastEvent.blob_x===undefined){return;}'
+            '  var d=lastEvent;'
+            '  var scale=LORES_TO_HIRES_X/2;'
+            '  var x1=Math.round(d.blob_x*scale);'
+            '  var x2=Math.round((d.blob_x+d.blob_width)*scale);'
+            '  ctx.strokeStyle="rgba(255,80,80,0.9)";'
+            '  ctx.lineWidth=2;'
+            '  ctx.beginPath();ctx.moveTo(x1,0);ctx.lineTo(x1,canvas.height);ctx.stroke();'
+            '  ctx.beginPath();ctx.moveTo(x2,0);ctx.lineTo(x2,canvas.height);ctx.stroke();'
+            '}'
             'function refreshInfo(){'
             '  fetch("/info").then(r=>r.json()).then(arr=>{'
             '    if(!arr.length){return;}'
+            '    lastEvent=arr[0];'
             '    var lines=arr.slice().reverse().map(function(d){'
             '      var lidar = "";'
+            '      var wStr = d.blob_width+"px";'
+            '      var velStr = (d.velocity!==null?(d.velocity>=0?"+":"")+d.velocity.toFixed(2):"?")+"px/fr";'
+            '      var spdStr = "";'
             '      if(d.lidar_d !== null && d.lidar_d !== undefined){'
             '        var dtSign = d.lidar_dt >= 0 ? "+" : "";'
             '        lidar = "  lidar:" + d.lidar_d.toFixed(2) + "m"'
             '               + " " + d.lidar_dur + "ms"'
             '               + " dt=" + dtSign + d.lidar_dt.toFixed(3) + "s";'
+            '        var u_mm = (d.lidar_d + ROAD_OFFSET_M) * 1000.0;'
+            '        var v_mm = (FOCAL_MM * u_mm) / (u_mm - FOCAL_MM);'
+            '        var mag  = v_mm / u_mm;'
+            '        var img_mm = (d.blob_width / LORES_WIDTH_PX) * SENSOR_WIDTH_MM;'
+            '        var len_m = (img_mm / mag) / 1000.0;'
+            '        wStr = len_m.toFixed(2) + "m";'
+            '        var spd_ms_lidar = len_m / (d.lidar_dur / 1000.0);'
+            '        var spd_mph = spd_ms_lidar * 2.23694;'
+            '        if(d.velocity !== null && d.velocity < 0) spd_mph = -spd_mph;'
+            '        var spdSign = spd_mph >= 0 ? "+" : "";'
+            '        spdStr = "  " + spdSign + spd_mph.toFixed(1) + "mph(L)";'
+            '        if(d.velocity !== null){'
+            '          var mm_per_px = (SENSOR_WIDTH_MM / LORES_WIDTH_PX) / mag;'
+            '          var vel_ms = d.velocity * FRAME_RATE * mm_per_px / 1000.0;'
+            '          var vel_mph = vel_ms * 2.23694;'
+            '          var velSign = vel_mph >= 0 ? "+" : "";'
+            '          velStr = velSign + vel_mph.toFixed(1) + "mph(C)";'
+            '        }'
             '      } else {'
             '        lidar = "  lidar:--";'
             '      }'
             '      return "#"+d.event_count'
             '        +"  "+d.time_str'
-            '        +"  w="+d.blob_width+"px"'
-            '        +"  frames="+String(d.event_frames).padStart(2,"0")'
+            '        +"  w="+wStr'
             '        +"  type="+d.event_type'
-            '        +"  vel="+(d.velocity!==null?(d.velocity>=0?"+":"")+d.velocity.toFixed(2):"?")+"px/fr"'
-            '        +lidar;'
+            '        +"  vel="+velStr'
+            '        +lidar'
+            '        +spdStr;'
             '    });'
             '    document.getElementById("info").textContent=lines.join("\\n");'
+            '    drawOverlay();'
             '  }).catch(()=>{});'
             '}'
             'setInterval(function(){'
@@ -965,6 +1130,7 @@ def _flask_thread(state: PreviewState, port: int):
             '  t.src="/thumb?t="+Date.now();'
             '  refreshInfo();'
             '},5000);'
+            'document.getElementById("thumb").onload=function(){drawOverlay();};'
             'refreshInfo();'
             '</script>'
             '</body></html>',
@@ -973,11 +1139,19 @@ def _flask_thread(state: PreviewState, port: int):
     def _gen():
         while True:
             with state.lock:
-                frame = state.jpeg
+                frame = state.focus_jpeg if state.focus_mode else state.jpeg
             if frame:
                 yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
                        + frame + b'\r\n')
             time.sleep(0.25)   # poll at 20 Hz; image itself updates at ~4 fps
+
+    @app.route('/focus', methods=['POST'])
+    def focus():
+        import json as _json
+        with state.lock:
+            state.focus_mode = not state.focus_mode
+            mode = state.focus_mode
+        return Response(_json.dumps({'focus': mode}), mimetype='application/json')
 
     @app.route('/stream')
     def stream():
@@ -1222,8 +1396,16 @@ def pick_and_save(phase_history, vehicle_frame_indices, hires_buf,
              label, [e[3] for e in to_save], chosen_fi,
              f"{pred:.1f}" if pred is not None else "–", chosen_by, lag,
              str(_chosen_w) if _chosen_w is not None else "?")
-    if event_meta is not None and _chosen_w is not None:
+    # Use bbox of the first saved frame (the thumbnail frame) for the web overlay
+    # so blob_x/blob_width match what is actually displayed.
+    _thumb_bbox = fi_bbox.get(to_save[0][3])
+    _overlay_bbox = _thumb_bbox if _thumb_bbox is not None else _chosen_bbox
+    if event_meta is not None and _overlay_bbox is not None:
         event_meta = dict(event_meta)   # don't mutate caller's dict
+        event_meta['blob_width'] = _overlay_bbox[2]
+        event_meta['blob_x']     = _overlay_bbox[0]
+    elif event_meta is not None and _chosen_w is not None:
+        event_meta = dict(event_meta)
         event_meta['blob_width'] = _chosen_w
     frames_to_save = [(bgr, stem, fi_bbox.get(entry_fi), meta) for bgr, stem, meta, entry_fi in to_save]
     start_save(frames_to_save, event_count, rightward,
@@ -1296,10 +1478,15 @@ def save_long_vehicle_ends(vehicle_edge_frames, hires_buf, event_count, fi_bbox,
             continue
         log.info("  [long %s] saving fi=%s  (anchor_fi=%d  lag=%d)",
                  label, [e[3] for e in to_save], anchor_fi, HIRES_LAG_FRAMES)
+        _thumb_bbox = fi_bbox.get(to_save[0][3])
+        _em = dict(event_meta) if event_meta is not None else {}
+        if _thumb_bbox is not None:
+            _em['blob_width'] = _thumb_bbox[2]
+            _em['blob_x']     = _thumb_bbox[0]
         frames_to_save = [(bgr, stem, fi_bbox.get(entry_fi), meta)
                           for bgr, stem, meta, entry_fi in to_save]
         start_save(frames_to_save, event_count, rightward,
-                   event_meta=event_meta, preview_state=preview_state,
+                   event_meta=_em, preview_state=preview_state,
                    fi_mask=fi_mask)
 
 
@@ -1828,14 +2015,10 @@ def main():
                 event_count += 1
                 _save_event_num(event_count)
 
-                # Compute signed velocity (lores px/frame) from eval_history
-                # (phase1 only when phase1_only, else full centroid history).
-                _velocity = None
-                if len(eval_history) >= 4:
-                    _cx_val = np.array([c for _, c, *_ in eval_history], dtype=np.float32)
-                    _cx_idx = np.arange(len(_cx_val), dtype=np.float32)
-                    _vel_coeffs = np.polyfit(_cx_idx, _cx_val, 1)
-                    _velocity = float(_vel_coeffs[0])
+                # Compute signed velocity (lores px/frame) from eval_history.
+                # Prefers interior-only frames; falls back to full history.
+                # (phase1 only when phase1_only, else full centroid history.)
+                _velocity = _fit_velocity(eval_history)
 
                 _event_type = ('split' if valid_split
                                else 'phase1' if phase1_only
@@ -1885,7 +2068,12 @@ def main():
                                     adjusted_fi)
                     else:
                         _chosen_bbox = fi_bbox.get(chosen_fi)
-                        if _chosen_bbox is not None:
+                        _thumb_bbox  = fi_bbox.get(to_save[0][3])
+                        _overlay_bbox = _thumb_bbox if _thumb_bbox is not None else _chosen_bbox
+                        if _overlay_bbox is not None:
+                            _event_meta['blob_width'] = _overlay_bbox[2]
+                            _event_meta['blob_x']     = _overlay_bbox[0]
+                        elif _chosen_bbox is not None:
                             _event_meta['blob_width'] = _chosen_bbox[2]
                         log.info("  saving fi=%s  (chosen_fi=%d  lag=%d  chosen_w=%d  max_w=%d)",
                                  [e[3] for e in to_save], chosen_fi, lag,
@@ -1924,12 +2112,8 @@ def main():
                     event_count += 1
                     _save_event_num(event_count)
 
-                    _velocity = None
-                    if len(eval_history) >= 4:
-                        _cx_val = np.array([c for _, c, *_ in eval_history], dtype=np.float32)
-                        _cx_idx = np.arange(len(_cx_val), dtype=np.float32)
-                        _vel_coeffs = np.polyfit(_cx_idx, _cx_val, 1)
-                        _velocity = float(_vel_coeffs[0])
+                    # Compute signed velocity using interior-only frames when available.
+                    _velocity = _fit_velocity(eval_history)
 
                     _event_type = 'long' if is_long else 'normal'
                     _event_meta = {
@@ -1957,6 +2141,7 @@ def main():
                             _mid_bbox = fi_bbox.get(to_save[0][3])
                             if _mid_bbox is not None:
                                 _event_meta['blob_width'] = _mid_bbox[2]
+                                _event_meta['blob_x']     = _mid_bbox[0]
                             log.info("  saving fi=%s  (mid_fi=%.1f  no interior frames  chosen_w=%d)",
                                      [e[3] for e in to_save], mid_fi, _event_meta['blob_width'])
                             frames_to_save = [(bgr, stem, fi_bbox.get(entry_fi), meta)
@@ -2011,7 +2196,7 @@ def main():
 
         # Write preview frame at ~4 fps
         if fi % int(FRAME_RATE / 4) == 0:
-            _preview_writer(preview_state, lores_bgr, fg_mask)
+            _preview_writer(preview_state, lores_bgr, fg_mask, hires_bgr)
 
         fi += 1
 
