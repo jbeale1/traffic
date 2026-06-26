@@ -7,7 +7,6 @@ When a vehicle event ends, saves the two high-res frames closest to the estimate
 center position to /dev/shm/burst/, then rsyncs them to a remote host.
 Configured for IMX296 (global shutter) camera
 
-
 Usage:
     python3 vehicle_detect.py [--tune FILE] [--shutter US] [--gain G] [--ev EV]
 """
@@ -41,7 +40,7 @@ from infer_onnx_wheels import OnnxWheelDetector, DEFAULT_CONF, DEFAULT_IOU, CLAS
 # Configuration
 # ---------------------------------------------------------------------------
 
-VERSION        = "1.122" # idle-gated periodic sensor-clock drift discipline (bounded re-anchor + EMA rate)
+VERSION        = "1.204" # web UI: max speed shows abs value + direction; space before mph
 FRAME_RATE     = 20.0
 LORES_SIZE     = (320, 240)
 HIRES_SIZE     = (1456, 1088)
@@ -59,6 +58,25 @@ HIRES_CROP_BOTTOM = 830+91
 # ONNX vehicle/wheel detector, run on each saved (unblurred) frame to produce
 # accurate BBox coordinates for the ImageDescription EXIF tag.
 ONNX_MODEL_PATH = "/home/pi/yolo/best.onnx"
+
+# ---------------------------------------------------------------------------
+# Fiducial marker template matching + pixel-distance calibration
+# ---------------------------------------------------------------------------
+_SCRIPT_DIR = Path(__file__).resolve().parent
+
+# Template image and calibration JSON must live alongside this script.
+FID_TEMPLATE_PATH = _SCRIPT_DIR / "dw_marker.png"
+FID_CALIB_PATH    = _SCRIPT_DIR / "exif_data_sigma.json"
+
+# Offset (px) from template upper-left corner to the marker tip in the JPEG.
+FID_TEMP_OFF_X = 28
+FID_TEMP_OFF_Y = 32
+
+# Fraction of frame height to search (from the bottom) for the fiducial.
+FID_SEARCH_FRAC = 0.25
+
+# Minimum normalised cross-correlation score to accept a fiducial detection.
+FID_SCORE_THRESHOLD = 0.70
 
 # Background blur applied outside the vehicle bounding box before JPEG save.
 # Reduces file size by softening high-frequency background (trees, grass, etc.).
@@ -818,8 +836,85 @@ def _format_bbox_field(boxes: dict) -> str:
     return ','.join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Fiducial marker detection + pixel-to-distance estimation
+# ---------------------------------------------------------------------------
+
+def _load_fiducial_resources():
+    """Load template image and calibration JSON once at startup.
+    Returns (template_gray, coeffs, dy_min, dy_max) or None on failure."""
+    import json as _json
+    try:
+        tmpl = cv2.imread(str(FID_TEMPLATE_PATH), cv2.IMREAD_GRAYSCALE)
+        if tmpl is None:
+            raise FileNotFoundError(f"Cannot read fiducial template: {FID_TEMPLATE_PATH}")
+        with open(FID_CALIB_PATH) as f:
+            cal = _json.load(f)
+        coeffs = np.array(cal["coeffs"])
+        dy_min, dy_max = cal["delta_y_range"]
+        log.info("[fid] loaded template %s (%dx%d) and calibration %s  "
+                 "poly_degree=%d  delta_y_range=[%s,%s]",
+                 FID_TEMPLATE_PATH.name, tmpl.shape[1], tmpl.shape[0],
+                 FID_CALIB_PATH.name, cal["poly_degree"], dy_min, dy_max)
+        return tmpl, coeffs, dy_min, dy_max
+    except Exception as exc:
+        log.warning("[fid] fiducial resources not available: %s — fid/vdist EXIF disabled", exc)
+        return None
+
+
+# Loaded once at module level; None means fiducial detection is disabled.
+_FID_RESOURCES = None   # set in main() after logging is configured
+
+
+def _scan_fiducial(bgr_frame):
+    """Run template match on bgr_frame (already in saved-JPEG pixel space).
+    Returns (fid_x, fid_y, vdist_m) if a confident match is found, else
+    (None, None, None).  All coordinates are in bgr_frame pixel space."""
+    if _FID_RESOURCES is None:
+        return None, None, None
+    tmpl_gray, coeffs, dy_min, dy_max = _FID_RESOURCES
+
+    gray = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    th, tw = tmpl_gray.shape
+
+    # Search only the lower FID_SEARCH_FRAC of the frame.
+    y0 = max(0, min(int(h * (1.0 - FID_SEARCH_FRAC)), h - th))
+    region = gray[y0:h, 0:w]
+    if region.shape[0] < th or region.shape[1] < tw:
+        return None, None, None
+
+    result = cv2.matchTemplate(region, tmpl_gray, cv2.TM_CCOEFF_NORMED)
+    _, score, _, best_loc = cv2.minMaxLoc(result)
+    if score < FID_SCORE_THRESHOLD:
+        return None, None, None
+
+    fid_x = best_loc[0] + FID_TEMP_OFF_X
+    fid_y = best_loc[1] + y0 + FID_TEMP_OFF_Y
+
+    # Estimate vehicle distance from body bottom edge if BBox is available;
+    # caller computes delta_y and passes it back via vdist.  Here we just
+    # return the raw fiducial position; distance is computed in _build_exif
+    # where bbox_onnx is also available.
+    return fid_x, fid_y, score
+
+
+def _estimate_vdist(fid_y, bbox_onnx, coeffs):
+    """Return estimated vehicle distance in metres, or None."""
+    if bbox_onnx is None or coeffs is None:
+        return None
+    vehicle_box = bbox_onnx.get("vehicle")
+    if vehicle_box is None:
+        return None
+    body_y2 = vehicle_box[3]          # bottom of vehicle bounding box
+    delta_y = fid_y - body_y2
+    dist_mm = float(np.polyval(coeffs, delta_y))
+    return dist_mm / 1000.0           # convert mm -> metres
+
+
 def _build_exif(meta: dict, bbox_onnx=None, subject_distance_m=None,
-                mm_per_px=None, speed_mph=None):
+                mm_per_px=None, speed_mph=None, fid_x=None, fid_y=None,
+                vdist_m=None):
     """Build a Pillow ExifData object from libcamera metadata.
 
     Tags that are SRATIONAL (signed rational) -- ShutterSpeedValue, BrightnessValue --
@@ -887,6 +982,10 @@ def _build_exif(meta: dict, bbox_onnx=None, subject_distance_m=None,
         desc_parts.append(f"sc={mm_per_px:.3f}")
     if speed_mph is not None:
         desc_parts.append(f"v={speed_mph:+.1f}")
+    if fid_x is not None and fid_y is not None:
+        desc_parts.append(f"fid={int(fid_x)},{int(fid_y)}")
+    if vdist_m is not None:
+        desc_parts.append(f"vdist={vdist_m:.2f}")
     if desc_parts:
         exif[0x010E] = " ".join(desc_parts)   # ImageDescription, top-level IFD0
 
@@ -1022,6 +1121,20 @@ def _compute_onnx_scale_and_speed(lidar_d_m, onnx_frames):
 
     f0, fN  = onnx_frames[0], onnx_frames[-1]
     fi_gap  = fN['fi'] - f0['fi']
+
+    # Require all three boxes populated in both frames.  A partial detection
+    # (e.g. only a rear wheel on a partly-visible e-bike, or the detector
+    # reporting different wheels across frames) produces an erroneous dx and
+    # therefore an erroneous speed.  Skip speed and scale in that case.
+    _required = ('vehicle', 'front_wheel', 'rear_wheel')
+    if any(f0.get(k) is None or fN.get(k) is None for k in _required):
+        log.info("[onnx_speed] incomplete BBox in frame pair — speed/scale suppressed "
+                 "(f0: v=%s fw=%s rw=%s  fN: v=%s fw=%s rw=%s)",
+                 f0.get('vehicle') is not None, f0.get('front_wheel') is not None,
+                 f0.get('rear_wheel') is not None,
+                 fN.get('vehicle') is not None, fN.get('front_wheel') is not None,
+                 fN.get('rear_wheel') is not None)
+        return None, None
 
     def _wheel_dx(a, b):
         if a is None or b is None:
@@ -1180,7 +1293,7 @@ def _flush_pending_jpegs(info: dict):
     lidar_d may be None (no match) or a float (matched distance in metres).
 
     info['_pending_jpegs'] is a list of:
-        (path, pil_img, meta, bbox_onnx, frame_idx, cropped_bgr)
+        (path, pil_img, meta, bbox_onnx, frame_idx, cropped_bgr, fid_x, fid_y, vdist_m)
     cropped_bgr is kept for every frame so each can be thumbnailed for the
     web UI's "frame" stepper (THUMB_PATHS[frame_idx], capped at
     MAX_DISPLAY_FRAMES).
@@ -1212,9 +1325,13 @@ def _flush_pending_jpegs(info: dict):
     SHM_BASE.mkdir(parents=True, exist_ok=True)
     saved = []
     thumb_frame_count = 0
-    for path, pil_img, meta, bbox_onnx, frame_idx, cropped_bgr in pending:
+    first_vdist = None
+    for path, pil_img, meta, bbox_onnx, frame_idx, cropped_bgr, fid_x, fid_y, vdist_m in pending:
+        if first_vdist is None and vdist_m is not None:
+            first_vdist = vdist_m
         exif = _build_exif(meta, bbox_onnx, subject_distance_m=subject_distance_m,
-                           mm_per_px=mm_per_px, speed_mph=speed_mph) if meta else None
+                           mm_per_px=mm_per_px, speed_mph=speed_mph,
+                           fid_x=fid_x, fid_y=fid_y, vdist_m=vdist_m) if meta else None
         pil_img.save(str(path), format="JPEG", quality=JPEG_QUALITY, exif=exif)
         if cropped_bgr is not None and frame_idx < MAX_DISPLAY_FRAMES:
             th, tw = cropped_bgr.shape[:2]
@@ -1226,6 +1343,10 @@ def _flush_pending_jpegs(info: dict):
             thumb_frame_count = max(thumb_frame_count, frame_idx + 1)
         saved.append(path.name)
         log.info("[save] event %d  → %s", info.get('event_count', '?'), path.name)
+
+    # Store vdist in info so the /info JSON endpoint can surface it in the web UI.
+    if first_vdist is not None:
+        info['vdist_m'] = round(first_vdist, 2)
 
     # Record which event's image(s) now sit at THUMB_PATHS, and how many
     # frames are valid, so the web UI can tell when /info has already moved
@@ -1290,6 +1411,17 @@ def _save_and_transfer(frames, event_count, rightward=True, event_meta=None,
         # directly in the saved JPEG's pixel space since blur doesn't change geometry.
         unblurred_cropped = hires_bgr[HIRES_CROP_TOP:HIRES_CROP_BOTTOM, :]
         bbox_onnx = _detect_vehicle_wheels(unblurred_cropped)
+
+        # Fiducial marker scan (runs on unblurred frame before background blur).
+        _fid_x, _fid_y, _fid_score = _scan_fiducial(unblurred_cropped)
+        _vdist_m = None
+        if _fid_x is not None:
+            _vdist_m = _estimate_vdist(_fid_y, bbox_onnx,
+                                        _FID_RESOURCES[1] if _FID_RESOURCES else None)
+            log.debug("[fid] fid=(%d,%d) score=%.3f vdist=%s m",
+                      _fid_x, _fid_y, _fid_score,
+                      f"{_vdist_m:.2f}" if _vdist_m is not None else "N/A")
+
         processed = blur_background(hires_bgr, union_bbox, rightward)
         cropped   = processed[HIRES_CROP_TOP:HIRES_CROP_BOTTOM, :]
         rgb       = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
@@ -1304,7 +1436,8 @@ def _save_and_transfer(frames, event_count, rightward=True, event_meta=None,
                                'vehicle':     bbox_onnx.get('vehicle'),
                                'front_wheel': bbox_onnx.get('front_wheel'),
                                'rear_wheel':  bbox_onnx.get('rear_wheel')})
-        pending_jpegs.append((path, pil_img, meta, bbox_onnx, frame_idx, cropped_bgr))
+        pending_jpegs.append((path, pil_img, meta, bbox_onnx, frame_idx, cropped_bgr,
+                               _fid_x, _fid_y, _vdist_m))
 
         if first_frame:
             # Derive capture time from stem (YYYYMMDD_HHMMSS_mmm)
@@ -1363,7 +1496,7 @@ def _save_and_transfer(frames, event_count, rightward=True, event_meta=None,
         # Write mask PNGs immediately (no LiDAR data needed); JPEGs deferred.
         if SAVE_MASK and fi_mask is not None:
             SHM_BASE.mkdir(parents=True, exist_ok=True)
-            for path, _pil, _meta, _bbox, _fidx, _cbgr in pending_jpegs:
+            for path, _pil, _meta, _bbox, _fidx, _cbgr, *_ in pending_jpegs:
                 stem = path.stem.rsplit('_', 1)[0]   # strip _<event_count> suffix
                 mask_roi  = fi_mask.get(stem)
                 png_bytes = _build_mask_png(mask_roi)
@@ -1375,8 +1508,9 @@ def _save_and_transfer(frames, event_count, rightward=True, event_meta=None,
     else:
         # No event_meta path — write immediately without LiDAR (no info dict to register)
         SHM_BASE.mkdir(parents=True, exist_ok=True)
-        for path, pil_img, meta, bbox_onnx, _fidx, cropped_bgr in pending_jpegs:
-            exif = _build_exif(meta, bbox_onnx) if meta else None
+        for path, pil_img, meta, bbox_onnx, _fidx, cropped_bgr, fid_x, fid_y, vdist_m in pending_jpegs:
+            exif = _build_exif(meta, bbox_onnx,
+                               fid_x=fid_x, fid_y=fid_y, vdist_m=vdist_m) if meta else None
             pil_img.save(str(path), format="JPEG", quality=JPEG_QUALITY, exif=exif)
             if _fidx == 0 and cropped_bgr is not None:
                 th, tw = cropped_bgr.shape[:2]
@@ -1387,7 +1521,7 @@ def _save_and_transfer(frames, event_count, rightward=True, event_meta=None,
                     str(THUMB_PATH), format="JPEG", quality=JPEG_QUALITY)
             log.info("[save] event %d  → %s (no event_meta)", event_count, path.name)
         if SAVE_MASK and fi_mask is not None:
-            for path, _pil, _meta, _bbox, _fidx, _cbgr in pending_jpegs:
+            for path, _pil, _meta, _bbox, _fidx, _cbgr, *_ in pending_jpegs:
                 stem = path.stem.rsplit('_', 1)[0]
                 mask_roi  = fi_mask.get(stem)
                 png_bytes = _build_mask_png(mask_roi)
@@ -1520,11 +1654,16 @@ def _flask_thread(state: PreviewState, port: int):
             'border-radius:4px;cursor:pointer}'
             '#daily-stats{color:#ccc;font-family:monospace;font-size:14px;'
             'background:#1e1e1e;padding:8px 16px;border-radius:4px;'
-            'white-space:pre;letter-spacing:0.03em;align-self:center}'
+            'white-space:pre;letter-spacing:0.03em;align-self:flex-start}'
+            '#version{color:#666;font-family:monospace;font-size:12px;'
+            'letter-spacing:0.05em;align-self:flex-start;padding-top:0}'
             '</style></head>'
             '<body>'
-            '<div style="display:flex;gap:12px;align-items:center">'
+            '<div style="display:flex;gap:12px;align-items:flex-start">'
+            '<div style="display:flex;flex-direction:column;gap:6px;align-items:flex-start">'
+            f'<div id="version">vehicle_detect v{VERSION}</div>'
             '<div id="daily-stats">—</div>'
+            '</div>'
             '<img src="/stream">'
             '</div>'
             '<div style="display:flex;gap:8px">'
@@ -1628,10 +1767,8 @@ def _flask_thread(state: PreviewState, port: int):
             '      var wStr = (d.blob_width!=null?d.blob_width:"?") + "px";'
             '      var velStr = "?";'
             '      if(d.lidar_d !== null && d.lidar_d !== undefined){'
-            '        var dtSign = d.lidar_dt >= 0 ? "+" : "";'
-            '        lidar = "  lidar:" + d.lidar_d.toFixed(2) + "m"'
-            '               + " " + d.lidar_dur + "ms"'
-            '               + " dt=" + dtSign + d.lidar_dt.toFixed(3) + "s";'
+            '        lidar = "  lidar:" + (d.lidar_d + ROAD_OFFSET_M).toFixed(2) + "m"'
+            '               + " " + d.lidar_dur + "ms";'
             '        var u_mm = (d.lidar_d + ROAD_OFFSET_M) * 1000.0;'
             '        var v_mm = (FOCAL_MM * u_mm) / (u_mm - FOCAL_MM);'
             '        var mag  = v_mm / u_mm;'
@@ -1668,6 +1805,7 @@ def _flask_thread(state: PreviewState, port: int):
             '        +"  w="+wStr'
             '        +"  type="+d.event_type'
             '        +"  vel="+velStr'
+            '        +(d.vdist_m != null ? "  vdist="+d.vdist_m.toFixed(2)+"m" : "")'
             '        +lidar;'
             '    });'
             '    document.getElementById("info").textContent=lines.join("\\n");'
@@ -1677,11 +1815,11 @@ def _flask_thread(state: PreviewState, port: int):
             'function refreshDailyStats(){'
             '  fetch("/daily_stats").then(r=>r.json()).then(function(s){'
             '    var lines=["cars: "+s.count];'
-            '    if(s.avg_mph!==null){lines.push("avg: "+s.avg_mph.toFixed(1)+"mph");}'
+            '    if(s.avg_mph!==null){lines.push("avg: "+Math.abs(s.avg_mph).toFixed(1)+" mph");}'
             '    else {lines.push("avg: --");}'
             '    if(s.max_mph!==null){'
-            '      var sign=s.max_mph>=0?"+":"";'
-            '      lines.push("max: "+sign+s.max_mph.toFixed(1)+"mph");'
+            '      var dir=s.max_mph<0?" (W)":" (E)";'
+            '      lines.push("max: "+Math.abs(s.max_mph).toFixed(1)+" mph"+dir);'
             '      lines.push("  @ "+s.max_time_str+"  #"+s.max_event_count);'
             '    } else {'
             '      lines.push("max: --");'
@@ -2199,6 +2337,10 @@ def main():
     today = datetime.now().date()
     event_count = _saved_num if _saved_date == today.strftime('%Y%m%d') else 0
     log.info("[event_num] starting at event %d for %s", event_count + 1, today)
+
+    # Load fiducial template and calibration data (logs success/failure via log).
+    global _FID_RESOURCES
+    _FID_RESOURCES = _load_fiducial_resources()
 
     # Restore today's speed-stats snapshot (empty if from a previous day or absent)
     _restored = _load_daily_stats_state()
